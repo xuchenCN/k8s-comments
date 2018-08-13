@@ -1,4 +1,7 @@
 # 一. 前期准备
+
+> [参考文档](http://www.heaventony.com/2017/06/28/k8s1-6-6%E9%9B%86%E7%BE%A4%E9%83%A8%E7%BD%B2-%E5%BC%80%E5%90%AFTLS%E5%AE%89%E5%85%A8%E8%AE%A4%E8%AF%81%EF%BC%88%E4%B8%80%EF%BC%89/)
+
 ### 1. 安装golang编译环境, 官网(golang.org)下载安装
 
 ### 2. git clone https://github.com/kubernetes/kubernetes.git
