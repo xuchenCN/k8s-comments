@@ -106,6 +106,9 @@ s, err := c.GenericConfig.New("kube-apiserver", delegationTarget)
 ```
 m.InstallLegacyAPI(&c, c.GenericConfig.RESTOptionsGetter, legacyRESTStorageProvider)
 ```
+master.go中有两个InstallAPI的地方 一个是这个 ```InstallLegacyAPI``` 还有一个```InstallAPIs```
+分别对应[config.go](staging/src/k8s.io/apiserver/pkg/server/config.go#L72)中的两个prefix
+
 进入该方法
 ```
 func (m *Master) InstallLegacyAPI(c *completedConfig, restOptionsGetter generic.RESTOptionsGetter, legacyRESTStorageProvider corerest.LegacyRESTStorageProvider) {
@@ -280,4 +283,58 @@ func (c LegacyRESTStorageProvider) NewLegacyRESTStorage(restOptionsGetter generi
 	return restStorage, apiGroupInfo, nil
 }
 ```
+主要看
+```
+apiGroupInfo := genericapiserver.APIGroupInfo{
+		PrioritizedVersions:          legacyscheme.Scheme.PrioritizedVersionsForGroup(""),
+		VersionedResourcesStorageMap: map[string]map[string]rest.Storage{},
+		Scheme:               legacyscheme.Scheme,
+		ParameterCodec:       legacyscheme.ParameterCodec,
+		NegotiatedSerializer: legacyscheme.Codecs,
+	}
+```
 
+主要结构```APIGroupInfo```
+```
+
+// Info about an API group.
+type APIGroupInfo struct {
+	PrioritizedVersions []schema.GroupVersion
+	// Info about the resources in this group. It's a map from version to resource to the storage.
+	VersionedResourcesStorageMap map[string]map[string]rest.Storage
+	// OptionsExternalVersion controls the APIVersion used for common objects in the
+	// schema like api.Status, api.DeleteOptions, and metav1.ListOptions. Other implementors may
+	// define a version "v1beta1" but want to use the Kubernetes "v1" internal objects.
+	// If nil, defaults to groupMeta.GroupVersion.
+	// TODO: Remove this when https://github.com/kubernetes/kubernetes/issues/19018 is fixed.
+	OptionsExternalVersion *schema.GroupVersion
+	// MetaGroupVersion defaults to "meta.k8s.io/v1" and is the scheme group version used to decode
+	// common API implementations like ListOptions. Future changes will allow this to vary by group
+	// version (for when the inevitable meta/v2 group emerges).
+	MetaGroupVersion *schema.GroupVersion
+
+	// Scheme includes all of the types used by this group and how to convert between them (or
+	// to convert objects from outside of this group that are accepted in this API).
+	// TODO: replace with interfaces
+	Scheme *runtime.Scheme
+	// NegotiatedSerializer controls how this group encodes and decodes data
+	NegotiatedSerializer runtime.NegotiatedSerializer
+	// ParameterCodec performs conversions for query parameters passed to API calls
+	ParameterCodec runtime.ParameterCodec
+}
+```
+其中```VersionedResourcesStorageMap``` 是定位资源的关键
+这个数据结构会维护一个 ```Group(v1,v1beta1,...) -> resources/subresources -> storage(实际操作Etcd)``` 的关系
+
+[186](pkg/master/master.go#L186)行开始定义了```map[string]rest.Storage``` 对应的是 resources/subresources = storage(其实就是对应Etcd的一些操作)
+
+```
+restStorageMap := map[string]rest.Storage{
+		"pods":             podStorage.Pod,
+		"pods/attach":      podStorage.Attach,
+		....
+		"componentStatuses": componentstatus.NewStorage(componentStatusStorage{c.StorageFactory}.serversToValidate),
+	}
+```
+239行 ```apiGroupInfo.VersionedResourcesStorageMap["v1"] = restStorageMap```
+其中```v1```是```Legacy```资源的Group,
