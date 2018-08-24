@@ -337,4 +337,131 @@ restStorageMap := map[string]rest.Storage{
 	}
 ```
 239行 ```apiGroupInfo.VersionedResourcesStorageMap["v1"] = restStorageMap```
-其中```v1```是```Legacy```资源的Group,
+其中```v1```是版本号,还有```v1beta1```,```v1alpha1```等
+接下来看 [master.go 386](pkg/master/master.go#L386) 行 
+```m.GenericAPIServer.InstallLegacyAPIGroup(genericapiserver.DefaultLegacyAPIPrefix, &apiGroupInfo)```
+这个方法的两个参数 ```DefaultLegacyAPIPrefix```是上边提到过的两个legacy , non-legacy两个prefix中的 legacy 就是 ```v1```这个值
+```apiGroupInfo``` 是之前 ```NewLegacyRESTStorage()```返回的
+```
+
+func (s *GenericAPIServer) InstallLegacyAPIGroup(apiPrefix string, apiGroupInfo *APIGroupInfo) error {
+	if !s.legacyAPIGroupPrefixes.Has(apiPrefix) {
+		return fmt.Errorf("%q is not in the allowed legacy API prefixes: %v", apiPrefix, s.legacyAPIGroupPrefixes.List())
+	}
+	if err := s.installAPIResources(apiPrefix, apiGroupInfo); err != nil {
+		return err
+	}
+
+	// Install the version handler.
+	// Add a handler at /<apiPrefix> to enumerate the supported api versions.
+	s.Handler.GoRestfulContainer.Add(discovery.NewLegacyRootAPIHandler(s.discoveryAddresses, s.Serializer, apiPrefix).WebService())
+
+	return nil
+}
+```
+主要看 ```installAPIResources()```
+
+```
+
+// installAPIResources is a private method for installing the REST storage backing each api groupversionresource
+func (s *GenericAPIServer) installAPIResources(apiPrefix string, apiGroupInfo *APIGroupInfo) error {
+	for _, groupVersion := range apiGroupInfo.PrioritizedVersions {
+		if len(apiGroupInfo.VersionedResourcesStorageMap[groupVersion.Version]) == 0 {
+			glog.Warningf("Skipping API %v because it has no resources.", groupVersion)
+			continue
+		}
+
+		apiGroupVersion := s.getAPIGroupVersion(apiGroupInfo, groupVersion, apiPrefix)
+		if apiGroupInfo.OptionsExternalVersion != nil {
+			apiGroupVersion.OptionsExternalVersion = apiGroupInfo.OptionsExternalVersion
+		}
+
+		if err := apiGroupVersion.InstallREST(s.Handler.GoRestfulContainer); err != nil {
+			return fmt.Errorf("unable to setup API %v: %v", apiGroupInfo, err)
+		}
+	}
+
+	return nil
+}
+```
+首先是一个for循环,遍历的内容是```apiGroupInfo.PrioritizedVersions```
+这个数据是通过各个包下边的install包提供的,首先看初始化 apiGroupInfo的时候
+```
+apiGroupInfo := genericapiserver.APIGroupInfo{
+		PrioritizedVersions:          legacyscheme.Scheme.PrioritizedVersionsForGroup(""),
+		VersionedResourcesStorageMap: map[string]map[string]rest.Storage{},
+		Scheme:               legacyscheme.Scheme,
+		ParameterCodec:       legacyscheme.ParameterCodec,
+		NegotiatedSerializer: legacyscheme.Codecs,
+	}
+```
+看这句
+```
+PrioritizedVersions:          legacyscheme.Scheme.PrioritizedVersionsForGroup(""),
+```
+内容
+```
+
+// PrioritizedVersionsForGroup returns versions for a single group in priority order
+func (s *Scheme) PrioritizedVersionsForGroup(group string) []schema.GroupVersion {
+	ret := []schema.GroupVersion{}
+	for _, version := range s.versionPriority[group] {
+		ret = append(ret, schema.GroupVersion{Group: group, Version: version})
+	}
+	for _, observedVersion := range s.observedVersions {
+		if observedVersion.Group != group {
+			continue
+		}
+		found := false
+		for _, existing := range ret {
+			if existing == observedVersion {
+				found = true
+				break
+			}
+		}
+		if !found {
+			ret = append(ret, observedVersion)
+		}
+	}
+
+	return ret
+}
+```
+遍历两个数据组织成最终的结果,搜索发现很多设置这两个的地方主要看 GroupName="" 的,等抽空加上断点再跟踪一下
+
+回头看```installAPIResources```
+```
+for _, groupVersion := range apiGroupInfo.PrioritizedVersions
+```
+这里的GroupVersion结构
+```
+type GroupVersion struct {
+	Group   string
+	Version string
+}
+```
+其中Group有类似```kubeadm.k8s.io```,```admission.k8s.io```...;
+其中Version有类似```v1```,```v1beta1```,...
+然后
+```
+apiGroupVersion := s.getAPIGroupVersion(apiGroupInfo, groupVersion, apiPrefix)
+```
+组织成一个带有GroupVersion的ApiInfo
+```
+func (s *GenericAPIServer) getAPIGroupVersion(apiGroupInfo *APIGroupInfo, groupVersion schema.GroupVersion, apiPrefix string) *genericapi.APIGroupVersion {
+	storage := make(map[string]rest.Storage)
+	for k, v := range apiGroupInfo.VersionedResourcesStorageMap[groupVersion.Version] {
+		storage[strings.ToLower(k)] = v
+	}
+	version := s.newAPIGroupVersion(apiGroupInfo, groupVersion)
+	version.Root = apiPrefix
+	version.Storage = storage
+	return version
+}
+```
+把该要的东西都组织到一起,apiPrefix,Storage等
+```
+apiGroupVersion.InstallREST(s.Handler.GoRestfulContainer)
+```
+
+
