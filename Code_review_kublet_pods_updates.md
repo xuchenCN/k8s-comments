@@ -347,4 +347,45 @@ func NewMux(merger Merger) *Mux {
 }
 ```
 
+回头继续看makePodSourceConfig()方法
 
+```
+	// source of all configuration
+	cfg := config.NewPodConfig(config.PodConfigNotificationIncremental, kubeDeps.Recorder)
+
+	// define file config source
+	if kubeCfg.StaticPodPath != "" {
+		glog.Infof("Adding pod path: %v", kubeCfg.StaticPodPath)
+		config.NewSourceFile(kubeCfg.StaticPodPath, nodeName, kubeCfg.FileCheckFrequency.Duration, cfg.Channel(kubetypes.FileSource))
+	}
+
+	// define url config source
+	if kubeCfg.StaticPodURL != "" {
+		glog.Infof("Adding pod url %q with HTTP header %v", kubeCfg.StaticPodURL, manifestURLHeader)
+		config.NewSourceURL(kubeCfg.StaticPodURL, manifestURLHeader, nodeName, kubeCfg.HTTPCheckFrequency.Duration, cfg.Channel(kubetypes.HTTPSource))
+	}
+
+	// Restore from the checkpoint path
+	// NOTE: This MUST happen before creating the apiserver source
+	// below, or the checkpoint would override the source of truth.
+
+	var updatechannel chan<- interface{}
+	if bootstrapCheckpointPath != "" {
+		glog.Infof("Adding checkpoint path: %v", bootstrapCheckpointPath)
+		updatechannel = cfg.Channel(kubetypes.ApiserverSource)
+		err := cfg.Restore(bootstrapCheckpointPath, updatechannel)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if kubeDeps.KubeClient != nil {
+		glog.Infof("Watching apiserver")
+		if updatechannel == nil {
+			updatechannel = cfg.Channel(kubetypes.ApiserverSource)
+		}
+		config.NewSourceApiserver(kubeDeps.KubeClient, nodeName, updatechannel)
+	}
+```
+
+可以看到初始化了
