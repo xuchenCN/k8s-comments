@@ -293,6 +293,115 @@ func RunKubelet(kubeServer *options.KubeletServer, kubeDeps *kubelet.Dependencie
 	return nil
 }
 ```
+
 接着看 CreateAndInitKubelet()
+
+```
+
+func CreateAndInitKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
+	...
+	) (k kubelet.Bootstrap, err error) {
+	// TODO: block until all sources have delivered at least one update to the channel, or break the sync loop
+	// up into "per source" synchronizations
+
+	k, err = kubelet.NewMainKubelet(kubeCfg,
+		...)
+	if err != nil {
+		return nil, err
+	}
+
+	k.BirthCry()
+
+	k.StartGarbageCollection()
+
+	return k, nil
+}
+```
+查看NewMainKubelet() 的[390行](pkg/kubelet/kubelet.go#L390)
+
+```
+	if kubeDeps.PodConfig == nil {
+		var err error
+		kubeDeps.PodConfig, err = makePodSourceConfig(kubeCfg, kubeDeps, nodeName, bootstrapCheckpointPath)
+		if err != nil {
+			return nil, err
+		}
+	}
+```
+
+查看 makePodSourceConfig() 这里有初始化updates channel的过程
+
+```
+// makePodSourceConfig creates a config.PodConfig from the given
+// KubeletConfiguration or returns an error.
+func makePodSourceConfig(kubeCfg *kubeletconfiginternal.KubeletConfiguration, kubeDeps *Dependencies, nodeName types.NodeName, bootstrapCheckpointPath string) (*config.PodConfig, error) {
+	...
+
+	// source of all configuration
+	cfg := config.NewPodConfig(config.PodConfigNotificationIncremental, kubeDeps.Recorder)
+	...
+}
+```
+
+看这个 ```func NewPodConfig(mode PodConfigNotificationMode, recorder record.EventRecorder) *PodConfig```
+
+PodConfigNotificationMode
+```
+// PodConfigNotificationMode describes how changes are sent to the update channel.
+type PodConfigNotificationMode int
+
+const (
+	// PodConfigNotificationUnknown is the default value for
+	// PodConfigNotificationMode when uninitialized.
+	PodConfigNotificationUnknown = iota
+	// PodConfigNotificationSnapshot delivers the full configuration as a SET whenever
+	// any change occurs.
+	PodConfigNotificationSnapshot
+	// PodConfigNotificationSnapshotAndUpdates delivers an UPDATE and DELETE message whenever pods are
+	// changed, and a SET message if there are any additions or removals.
+	PodConfigNotificationSnapshotAndUpdates
+	// PodConfigNotificationIncremental delivers ADD, UPDATE, DELETE, REMOVE, RECONCILE to the update channel.
+	PodConfigNotificationIncremental
+)
+```
+
+NewPodConfig()
+
+```
+
+// NewPodConfig creates an object that can merge many configuration sources into a stream
+// of normalized updates to a pod configuration.
+func NewPodConfig(mode PodConfigNotificationMode, recorder record.EventRecorder) *PodConfig {
+        //初始化 updates channel buffer=50
+	updates := make(chan kubetypes.PodUpdate, 50)
+	//初始化pod storage
+	storage := newPodStorage(updates, mode, recorder)
+	podConfig := &PodConfig{
+		pods:    storage,
+		//mux是一个将所有source merging到一起的类,具体定义看下边
+		mux:     config.NewMux(storage),
+		updates: updates,
+		sources: sets.String{},
+	}
+	return podConfig
+}
+
+```
+
+config.NewMux(storage)
+
+```
+
+// NewMux creates a new mux that can merge changes from multiple sources.
+func NewMux(merger Merger) *Mux {
+	mux := &Mux{
+		//用来维护 source -> channel 
+		sources: make(map[string]chan interface{}),
+		//其实就是podStorage
+		merger:  merger,
+	}
+	return mux
+}
+```
 
 
