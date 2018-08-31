@@ -112,35 +112,7 @@ func run(s *options.KubeletServer, kubeDeps *kubelet.Dependencies, stopCh <-chan
 		devicePluginEnabled := utilfeature.DefaultFeatureGate.Enabled(features.DevicePlugins)
 
 		kubeDeps.ContainerManager, err = cm.NewContainerManager(
-			kubeDeps.Mounter,
-			kubeDeps.CAdvisorInterface,
-			cm.NodeConfig{
-				RuntimeCgroupsName:    s.RuntimeCgroups,
-				SystemCgroupsName:     s.SystemCgroups,
-				KubeletCgroupsName:    s.KubeletCgroups,
-				ContainerRuntime:      s.ContainerRuntime,
-				CgroupsPerQOS:         s.CgroupsPerQOS,
-				CgroupRoot:            s.CgroupRoot,
-				CgroupDriver:          s.CgroupDriver,
-				KubeletRootDir:        s.RootDirectory,
-				ProtectKernelDefaults: s.ProtectKernelDefaults,
-				NodeAllocatableConfig: cm.NodeAllocatableConfig{
-					KubeReservedCgroupName:   s.KubeReservedCgroup,
-					SystemReservedCgroupName: s.SystemReservedCgroup,
-					EnforceNodeAllocatable:   sets.NewString(s.EnforceNodeAllocatable...),
-					KubeReserved:             kubeReserved,
-					SystemReserved:           systemReserved,
-					HardEvictionThresholds:   hardEvictionThresholds,
-				},
-				QOSReserved:                           *experimentalQOSReserved,
-				ExperimentalCPUManagerPolicy:          s.CPUManagerPolicy,
-				ExperimentalCPUManagerReconcilePeriod: s.CPUManagerReconcilePeriod.Duration,
-				ExperimentalPodPidsLimit:              s.PodPidsLimit,
-				EnforceCPULimits:                      s.CPUCFSQuota,
-			},
-			s.FailSwapOn,
-			devicePluginEnabled,
-			kubeDeps.Recorder)
+			...)
 
 		if err != nil {
 			return err
@@ -237,36 +209,7 @@ func RunKubelet(kubeServer *options.KubeletServer, kubeDeps *kubelet.Dependencie
 	}
   //主要看这里
 	k, err := CreateAndInitKubelet(&kubeServer.KubeletConfiguration,
-		kubeDeps,
-		&kubeServer.ContainerRuntimeOptions,
-		kubeServer.ContainerRuntime,
-		kubeServer.RuntimeCgroups,
-		kubeServer.HostnameOverride,
-		kubeServer.NodeIP,
-		kubeServer.ProviderID,
-		kubeServer.CloudProvider,
-		kubeServer.CertDirectory,
-		kubeServer.RootDirectory,
-		kubeServer.RegisterNode,
-		kubeServer.RegisterWithTaints,
-		kubeServer.AllowedUnsafeSysctls,
-		kubeServer.RemoteRuntimeEndpoint,
-		kubeServer.RemoteImageEndpoint,
-		kubeServer.ExperimentalMounterPath,
-		kubeServer.ExperimentalKernelMemcgNotification,
-		kubeServer.ExperimentalCheckNodeCapabilitiesBeforeMount,
-		kubeServer.ExperimentalNodeAllocatableIgnoreEvictionThreshold,
-		kubeServer.MinimumGCAge,
-		kubeServer.MaxPerPodContainerCount,
-		kubeServer.MaxContainerCount,
-		kubeServer.MasterServiceNamespace,
-		kubeServer.RegisterSchedulable,
-		kubeServer.NonMasqueradeCIDR,
-		kubeServer.KeepTerminatedPodVolumes,
-		kubeServer.NodeLabels,
-		kubeServer.SeccompProfileRoot,
-		kubeServer.BootstrapCheckpointPath,
-		kubeServer.NodeStatusMaxImages)
+		...)
 	if err != nil {
 		return fmt.Errorf("failed to create kubelet: %v", err)
 	}
