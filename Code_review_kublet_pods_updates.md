@@ -626,6 +626,7 @@ func (s *podStorage) merge(source string, change interface{}) (adds, updates, de
 ```
 上边的逻辑会过将不同source过来的数据放到一个map里,并且过滤重复的请求,并保证发送的数据的顺序
 
+后续的source也会merging不做介绍
 
 然后看创建Source
 
