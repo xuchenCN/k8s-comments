@@ -388,4 +388,532 @@ func NewMux(merger Merger) *Mux {
 	}
 ```
 
-可以看到初始化了
+可以看到初始化了三个surces
+File Source```config.NewSourceFile```
+URL Source ```config.NewSourceURL```
+API Source ```config.NewSourceApiserver```
+
+先看第一个 File
+
+```
+func NewSourceFile(path string, nodeName types.NodeName, period time.Duration, updates chan<- interface{}) {
+	// "golang.org/x/exp/inotify" requires a path without trailing "/"
+	path = strings.TrimRight(path, string(os.PathSeparator))
+
+	config := newSourceFile(path, nodeName, period, updates)
+	glog.V(1).Infof("Watching path %q", path)
+	config.run()
+}
+```
+查看 newSourceFile() 
+```
+func newSourceFile(path string, nodeName types.NodeName, period time.Duration, updates chan<- interface{}) *sourceFile {
+	//先定义send方法,该方法讲pods 封装成kubetypes.PodUpdate 然后放到updates channel中
+	send := func(objs []interface{}) {
+		var pods []*v1.Pod
+		for _, o := range objs {
+			pods = append(pods, o.(*v1.Pod))
+		}
+		updates <- kubetypes.PodUpdate{Pods: pods, Op: kubetypes.SET, Source: kubetypes.FileSource}
+	}
+	//初始化一个UndeltaStore下边详细介绍
+	store := cache.NewUndeltaStore(send, cache.MetaNamespaceKeyFunc)
+	//构造sourceFile对象
+	return &sourceFile{
+		path:           path,
+		nodeName:       nodeName,
+		period:         period,
+		store:          store,
+		fileKeyMapping: map[string]string{},
+		updates:        updates,
+		watchEvents:    make(chan *watchEvent, eventBufferLen),
+	}
+}
+```
+随后会调用sourceFile.run()方法,里边是间隔一段时间来读取所配置的path(directory or single file)的内容
+
+先来看看```NewUndeltaStore()```
+
+```
+// NewUndeltaStore returns an UndeltaStore implemented with a Store.
+func NewUndeltaStore(pushFunc func([]interface{}), keyFunc KeyFunc) *UndeltaStore {
+	return &UndeltaStore{
+		Store:    NewStore(keyFunc),
+		PushFunc: pushFunc,
+	}
+}
+```
+这里参数是pushFuc=send,keyFunc=cache.MetaNamespaceKeyFunc
+
+```MetaNamespaceKeyFunc()```很简单就是根据名称和namespace等生成key,或者使用原本就有的key
+
+看看 sourceFile.run() 方法
+
+``` 
+func (s *sourceFile) run() {
+	listTicker := time.NewTicker(s.period)
+
+	go func() {
+		// Read path immediately to speed up startup.
+		if err := s.listConfig(); err != nil {
+			glog.Errorf("Unable to read config path %q: %v", s.path, err)
+		}
+		for {
+			select {
+			case <-listTicker.C:
+				if err := s.listConfig(); err != nil {
+					glog.Errorf("Unable to read config path %q: %v", s.path, err)
+				}
+			case e := <-s.watchEvents:
+				if err := s.consumeWatchEvent(e); err != nil {
+					glog.Errorf("Unable to process watch event: %v", err)
+				}
+			}
+		}
+	}()
+
+	s.startWatch()
+}
+```
+
+主要看```listConfig()```
+
+``` 
+
+func (s *sourceFile) listConfig() error {
+    //首先进行验证
+	path := s.path
+	statInfo, err := os.Stat(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		// Emit an update with an empty PodList to allow FileSource to be marked as seen
+		s.updates <- kubetypes.PodUpdate{Pods: []*v1.Pod{}, Op: kubetypes.SET, Source: kubetypes.FileSource}
+		return fmt.Errorf("path does not exist, ignoring")
+	}
+    
+	switch {
+	//如果是dir就遍历dir下的文件然后调用extractFromFile()
+	case statInfo.Mode().IsDir():
+		pods, err := s.extractFromDir(path)
+		if err != nil {
+			return err
+		}
+		if len(pods) == 0 {
+			// Emit an update with an empty PodList to allow FileSource to be marked as seen
+			s.updates <- kubetypes.PodUpdate{Pods: pods, Op: kubetypes.SET, Source: kubetypes.FileSource}
+			return nil
+		}
+		return s.replaceStore(pods...)
+
+	case statInfo.Mode().IsRegular():
+	    //将文件内容解析验证然后返回
+		pod, err := s.extractFromFile(path)
+		if err != nil {
+			return err
+		}
+		//这里讲解析出的pod放到store具体看这个
+		return s.replaceStore(pod)
+
+	default:
+		return fmt.Errorf("path is not a directory or file")
+	}
+}
+```
+
+``` 
+func (s *sourceFile) replaceStore(pods ...*v1.Pod) (err error) {
+	objs := []interface{}{}
+	for _, pod := range pods {
+		objs = append(objs, pod)
+	}
+	return s.store.Replace(objs, "")
+}
+```
+
+这里的store是之前创建的UndeltaStore查看之后Replace()内容如下
+
+``` 
+func (u *UndeltaStore) Replace(list []interface{}, resourceVersion string) error {
+	//更新Store,这里因该是TheadSafeStore具体看上边定义
+	if err := u.Store.Replace(list, resourceVersion); err != nil {
+		return err
+	}
+	//将pods推送到updates
+	u.PushFunc(u.Store.List())
+	return nil
+}
+```
+
+发现是将解析的pods推送到了updates channel (之前定义的send方法)
+
+在来看```NewSourceURL()```
+
+``` 
+func NewSourceURL(url string, header http.Header, nodeName types.NodeName, period time.Duration, updates chan<- interface{}) {
+	config := &sourceURL{
+		url:      url,
+		header:   header,
+		nodeName: nodeName,
+		updates:  updates,
+		data:     nil,
+		// Timing out requests leads to retries. This client is only used to
+		// read the manifest URL passed to kubelet.
+		client: &http.Client{Timeout: 10 * time.Second},
+	}
+	glog.V(1).Infof("Watching URL %s", url)
+	go wait.Until(config.run, period, wait.NeverStop)
+}
+```
+
+套路很相似
+
+``` 
+func (s *sourceURL) run() {
+	if err := s.extractFromURL(); err != nil {
+		// Don't log this multiple times per minute. The first few entries should be
+		// enough to get the point across.
+		if s.failureLogs < 3 {
+			glog.Warningf("Failed to read pods from URL: %v", err)
+		} else if s.failureLogs == 3 {
+			glog.Warningf("Failed to read pods from URL. Dropping verbosity of this message to V(4): %v", err)
+		} else {
+			glog.V(4).Infof("Failed to read pods from URL: %v", err)
+		}
+		s.failureLogs++
+	} else {
+		if s.failureLogs > 0 {
+			glog.Info("Successfully read pods from URL.")
+			s.failureLogs = 0
+		}
+	}
+}
+```
+
+查看```extractFromURL()```
+
+``` 
+
+func (s *sourceURL) extractFromURL() error {
+	req, err := http.NewRequest("GET", s.url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header = s.header
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%v: %v", s.url, resp.Status)
+	}
+	if len(data) == 0 {
+		// Emit an update with an empty PodList to allow HTTPSource to be marked as seen
+		s.updates <- kubetypes.PodUpdate{Pods: []*v1.Pod{}, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
+		return fmt.Errorf("zero-length data received from %v", s.url)
+	}
+	// Short circuit if the data has not changed since the last time it was read.
+	if bytes.Compare(data, s.data) == 0 {
+		return nil
+	}
+	s.data = data
+
+	// First try as it is a single pod.
+	parsed, pod, singlePodErr := tryDecodeSinglePod(data, s.applyDefaults)
+	if parsed {
+		if singlePodErr != nil {
+			// It parsed but could not be used.
+			return singlePodErr
+		}
+		s.updates <- kubetypes.PodUpdate{Pods: []*v1.Pod{pod}, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
+		return nil
+	}
+
+	// That didn't work, so try a list of pods.
+	parsed, podList, multiPodErr := tryDecodePodList(data, s.applyDefaults)
+	if parsed {
+		if multiPodErr != nil {
+			// It parsed but could not be used.
+			return multiPodErr
+		}
+		pods := make([]*v1.Pod, 0)
+		for i := range podList.Items {
+			pods = append(pods, &podList.Items[i])
+		}
+		s.updates <- kubetypes.PodUpdate{Pods: pods, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
+		return nil
+	}
+
+	return fmt.Errorf("%v: received '%v', but couldn't parse as "+
+		"single (%v) or multiple pods (%v).\n",
+		s.url, string(data), singlePodErr, multiPodErr)
+}
+```
+
+是定期从指定URL中获取数据解析后推送到updates管道中
+
+最后看看```NewSourceApiserver()``` 这个相对其他两个稍微复杂点
+
+``` 
+// NewSourceApiserver creates a config source that watches and pulls from the apiserver.
+func NewSourceApiserver(c clientset.Interface, nodeName types.NodeName, updates chan<- interface{}) {
+	lw := cache.NewListWatchFromClient(c.CoreV1().RESTClient(), "pods", metav1.NamespaceAll, fields.OneTermEqualSelector(api.PodHostField, string(nodeName)))
+	newSourceApiserverFromLW(lw, updates)
+}
+```
+先初始化了一个ListWatch
+``` 
+// NewListWatchFromClient creates a new ListWatch from the specified client, resource, namespace and field selector.
+func NewListWatchFromClient(c Getter, resource string, namespace string, fieldSelector fields.Selector) *ListWatch {
+	optionsModifier := func(options *metav1.ListOptions) {
+		options.FieldSelector = fieldSelector.String()
+	}
+	return NewFilteredListWatchFromClient(c, resource, namespace, optionsModifier)
+}
+```
+先看看传入的参数
+```c Getter```一个rest apiserver的client
+
+```resource string``` 资源 pods
+
+```fieldSelector fields.Selector```
+
+```namespace``` NamespaceAll string = ""
+
+```fields.Selector``` fields.OneTermEqualSelector(api.PodHostField, string(nodeName))
+
+看下定义
+
+```
+// OneTermEqualSelector returns an object that matches objects where one field/field equals one value.
+// Cannot return an error.
+func OneTermEqualSelector(k, v string) Selector {
+	return &hasTerm{field: k, value: v}
+}
+```
+
+这个Selector 是字段与值匹配的Selector,字段是PodHostField = "spec.nodeName" 值是 hostname,很显然是要select那些属于这个hostname的pod
+
+接着看```NewFilteredListWatchFromClient()```
+
+```
+// NewFilteredListWatchFromClient creates a new ListWatch from the specified client, resource, namespace, and option modifier.
+// Option modifier is a function takes a ListOptions and modifies the consumed ListOptions. Provide customized modifier function
+// to apply modification to ListOptions with a field selector, a label selector, or any other desired options.
+func NewFilteredListWatchFromClient(c Getter, resource string, namespace string, optionsModifier func(options *metav1.ListOptions)) *ListWatch {
+	listFunc := func(options metav1.ListOptions) (runtime.Object, error) {
+		optionsModifier(&options)
+		return c.Get().
+			Namespace(namespace).
+			Resource(resource).
+			VersionedParams(&options, metav1.ParameterCodec).
+			Do().
+			Get()
+	}
+	watchFunc := func(options metav1.ListOptions) (watch.Interface, error) {
+		options.Watch = true
+		optionsModifier(&options)
+		return c.Get().
+			Namespace(namespace).
+			Resource(resource).
+			VersionedParams(&options, metav1.ParameterCodec).
+			Watch()
+	}
+	return &ListWatch{ListFunc: listFunc, WatchFunc: watchFunc}
+}
+```
+
+这个方法定义了list,watch方法,其中optionsModifier是上边定义过的将selector放到请求的options里
+
+回到 ```NewSourceApiserver()``` 继续看 ```newSourceApiserverFromLW(lw, updates)```
+
+这里传入了两个参数一个是lw是上边生成的两个方法(list,watch), 一个是updates channel
+
+``` 
+// newSourceApiserverFromLW holds creates a config source that watches and pulls from the apiserver.
+func newSourceApiserverFromLW(lw cache.ListerWatcher, updates chan<- interface{}) {
+	send := func(objs []interface{}) {
+		var pods []*v1.Pod
+		for _, o := range objs {
+			pods = append(pods, o.(*v1.Pod))
+		}
+		updates <- kubetypes.PodUpdate{Pods: pods, Op: kubetypes.SET, Source: kubetypes.ApiserverSource}
+	}
+	r := cache.NewReflector(lw, &v1.Pod{}, cache.NewUndeltaStore(send, cache.MetaNamespaceKeyFunc), 0)
+	go r.Run(wait.NeverStop)
+}
+```
+
+也是先定义了send方法,但是这次有点不同多了一些包装```r := cache.NewReflector(lw, &v1.Pod{}, cache.NewUndeltaStore(send, cache.MetaNamespaceKeyFunc), 0)```
+
+``` 
+// NewReflector creates a new Reflector object which will keep the given store up to
+// date with the server's contents for the given resource. Reflector promises to
+// only put things in the store that have the type of expectedType, unless expectedType
+// is nil. If resyncPeriod is non-zero, then lists will be executed after every
+// resyncPeriod, so that you can use reflectors to periodically process everything as
+// well as incrementally processing the things that change.
+func NewReflector(lw ListerWatcher, expectedType interface{}, store Store, resyncPeriod time.Duration) *Reflector {
+	return NewNamedReflector(naming.GetNameFromCallsite(internalPackages...), lw, expectedType, store, resyncPeriod)
+}
+```
+
+```
+// NewNamedReflector same as NewReflector, but with a specified name for logging
+func NewNamedReflector(name string, lw ListerWatcher, expectedType interface{}, store Store, resyncPeriod time.Duration) *Reflector {
+	reflectorSuffix := atomic.AddInt64(&reflectorDisambiguator, 1)
+	r := &Reflector{
+		name: name,
+		// we need this to be unique per process (some names are still the same) but obvious who it belongs to
+		metrics:       newReflectorMetrics(makeValidPrometheusMetricLabel(fmt.Sprintf("reflector_"+name+"_%d", reflectorSuffix))),
+		listerWatcher: lw,
+		store:         store,
+		expectedType:  reflect.TypeOf(expectedType),
+		period:        time.Second,
+		resyncPeriod:  resyncPeriod,
+		clock:         &clock.RealClock{},
+	}
+	return r
+}
+```
+
+看看 Refector的Run()
+
+```
+// Run starts a watch and handles watch events. Will restart the watch if it is closed.
+// Run will exit when stopCh is closed.
+func (r *Reflector) Run(stopCh <-chan struct{}) {
+	glog.V(3).Infof("Starting reflector %v (%s) from %s", r.expectedType, r.resyncPeriod, r.name)
+	wait.Until(func() {
+		if err := r.ListAndWatch(stopCh); err != nil {
+			utilruntime.HandleError(err)
+		}
+	}, r.period, stopCh)
+}
+```
+
+具体内容
+
+``` 
+
+// ListAndWatch first lists all items and get the resource version at the moment of call,
+// and then use the resource version to watch.
+// It returns error if ListAndWatch didn't even try to initialize watch.
+func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
+	glog.V(3).Infof("Listing and watching %v from %s", r.expectedType, r.name)
+	var resourceVersion string
+
+	// Explicitly set "0" as resource version - it's fine for the List()
+	// to be served from cache and potentially be delayed relative to
+	// etcd contents. Reflector framework will catch up via Watch() eventually.
+	options := metav1.ListOptions{ResourceVersion: "0"}
+	r.metrics.numberOfLists.Inc()
+	start := r.clock.Now()
+	list, err := r.listerWatcher.List(options)
+	if err != nil {
+		return fmt.Errorf("%s: Failed to list %v: %v", r.name, r.expectedType, err)
+	}
+	r.metrics.listDuration.Observe(time.Since(start).Seconds())
+	listMetaInterface, err := meta.ListAccessor(list)
+	if err != nil {
+		return fmt.Errorf("%s: Unable to understand list result %#v: %v", r.name, list, err)
+	}
+	resourceVersion = listMetaInterface.GetResourceVersion()
+	items, err := meta.ExtractList(list)
+	if err != nil {
+		return fmt.Errorf("%s: Unable to understand list result %#v (%v)", r.name, list, err)
+	}
+	r.metrics.numberOfItemsInList.Observe(float64(len(items)))
+	//这里边会调用 r.store.Replace(found, resourceVersion) 跟其他source一样会调用PushFunc
+	if err := r.syncWith(items, resourceVersion); err != nil {
+		return fmt.Errorf("%s: Unable to sync list result: %v", r.name, err)
+	}
+	r.setLastSyncResourceVersion(resourceVersion)
+
+	resyncerrc := make(chan error, 1)
+	cancelCh := make(chan struct{})
+	defer close(cancelCh)
+	go func() {
+		resyncCh, cleanup := r.resyncChan()
+		defer func() {
+			cleanup() // Call the last one written into cleanup
+		}()
+		for {
+			select {
+			case <-resyncCh:
+			case <-stopCh:
+				return
+			case <-cancelCh:
+				return
+			}
+			if r.ShouldResync == nil || r.ShouldResync() {
+				glog.V(4).Infof("%s: forcing resync", r.name)
+				if err := r.store.Resync(); err != nil {
+					resyncerrc <- err
+					return
+				}
+			}
+			cleanup()
+			resyncCh, cleanup = r.resyncChan()
+		}
+	}()
+
+	for {
+		// give the stopCh a chance to stop the loop, even in case of continue statements further down on errors
+		select {
+		case <-stopCh:
+			return nil
+		default:
+		}
+
+		timeoutSeconds := int64(minWatchTimeout.Seconds() * (rand.Float64() + 1.0))
+		options = metav1.ListOptions{
+			ResourceVersion: resourceVersion,
+			// We want to avoid situations of hanging watchers. Stop any wachers that do not
+			// receive any events within the timeout window.
+			TimeoutSeconds: &timeoutSeconds,
+		}
+
+		r.metrics.numberOfWatches.Inc()
+		w, err := r.listerWatcher.Watch(options)
+		if err != nil {
+			switch err {
+			case io.EOF:
+				// watch closed normally
+			case io.ErrUnexpectedEOF:
+				glog.V(1).Infof("%s: Watch for %v closed with unexpected EOF: %v", r.name, r.expectedType, err)
+			default:
+				utilruntime.HandleError(fmt.Errorf("%s: Failed to watch %v: %v", r.name, r.expectedType, err))
+			}
+			// If this is "connection refused" error, it means that most likely apiserver is not responsive.
+			// It doesn't make sense to re-list all objects because most likely we will be able to restart
+			// watch where we ended.
+			// If that's the case wait and resend watch request.
+			if urlError, ok := err.(*url.Error); ok {
+				if opError, ok := urlError.Err.(*net.OpError); ok {
+					if errno, ok := opError.Err.(syscall.Errno); ok && errno == syscall.ECONNREFUSED {
+						time.Sleep(time.Second)
+						continue
+					}
+				}
+			}
+			return nil
+		}
+        //这个watchHandler会对应一些操作具体也是会调用PushFunc并且会修改cache
+		if err := r.watchHandler(w, &resourceVersion, resyncerrc, stopCh); err != nil {
+			if err != errorStopRequested {
+				glog.Warningf("%s: watch of %v ended with: %v", r.name, r.expectedType, err)
+			}
+			return nil
+		}
+	}
+}
+```
+上边的操作会对拿到的Pods数据进行组织并且推送到updates channel
+这些updates channel到底如何消费呢?
