@@ -395,6 +395,240 @@ API Source ```config.NewSourceApiserver```
 
 先看第一个 File
 
+并不是source拿到的数据就直接push到Updates channel里 而是分了不同的source来进行merging
+这里 ```cfg.Channel(kubetypes.FileSource)``` 会初始化一个goroutine来merging数据
+
+``` 
+// Channel creates or returns a config source channel.  The channel
+// only accepts PodUpdates
+func (c *PodConfig) Channel(source string) chan<- interface{} {
+	c.sourcesLock.Lock()
+	defer c.sourcesLock.Unlock()
+	c.sources.Insert(source)
+	return c.mux.Channel(source)
+}
+```
+看```return c.mux.Channel(source)```
+
+``` 
+
+// Channel returns a channel where a configuration source
+// can send updates of new configurations. Multiple calls with the same
+// source will return the same channel. This allows change and state based sources
+// to use the same channel. Different source names however will be treated as a
+// union.
+func (m *Mux) Channel(source string) chan interface{} {
+	if len(source) == 0 {
+		panic("Channel given an empty name")
+	}
+	m.sourceLock.Lock()
+	defer m.sourceLock.Unlock()
+	channel, exists := m.sources[source]
+	if exists {
+		return channel
+	}
+	newChannel := make(chan interface{})
+	m.sources[source] = newChannel
+	go wait.Until(func() { m.listen(source, newChannel) }, 0, wait.NeverStop)
+	return newChannel
+}
+```
+对应的source名称初始化了一个channel
+
+```
+go wait.Until(func() { m.listen(source, newChannel) }, 0, wait.NeverStop)
+```
+这里的```m.listen(source, newChannel)```内容如下
+``` 
+func (m *Mux) listen(source string, listenChannel <-chan interface{}) {
+	for update := range listenChannel {
+		m.merger.Merge(source, update)
+	}
+}
+```
+这里一个for range获得channel的数据,然后调用```m.merger.Merge(source, update)```
+
+这个```merger```上边提到过其实就是podStorage,内容如下,这里的s.mode为```config.PodConfigNotificationIncremental```
+
+``` 
+// Merge normalizes a set of incoming changes from different sources into a map of all Pods
+// and ensures that redundant changes are filtered out, and then pushes zero or more minimal
+// updates onto the update channel.  Ensures that updates are delivered in order.
+func (s *podStorage) Merge(source string, change interface{}) error {
+	s.updateLock.Lock()
+	defer s.updateLock.Unlock()
+
+	seenBefore := s.sourcesSeen.Has(source)
+	adds, updates, deletes, removes, reconciles, restores := s.merge(source, change)
+	firstSet := !seenBefore && s.sourcesSeen.Has(source)
+
+	// deliver update notifications
+	switch s.mode {
+	case PodConfigNotificationIncremental:
+		if len(removes.Pods) > 0 {
+			s.updates <- *removes
+		}
+		if len(adds.Pods) > 0 {
+			s.updates <- *adds
+		}
+		if len(updates.Pods) > 0 {
+			s.updates <- *updates
+		}
+		if len(deletes.Pods) > 0 {
+			s.updates <- *deletes
+		}
+		if len(restores.Pods) > 0 {
+			s.updates <- *restores
+		}
+		if firstSet && len(adds.Pods) == 0 && len(updates.Pods) == 0 && len(deletes.Pods) == 0 {
+			// Send an empty update when first seeing the source and there are
+			// no ADD or UPDATE or DELETE pods from the source. This signals kubelet that
+			// the source is ready.
+			s.updates <- *adds
+		}
+		// Only add reconcile support here, because kubelet doesn't support Snapshot update now.
+		if len(reconciles.Pods) > 0 {
+			s.updates <- *reconciles
+		}
+
+	case PodConfigNotificationSnapshotAndUpdates:
+		if len(removes.Pods) > 0 || len(adds.Pods) > 0 || firstSet {
+			s.updates <- kubetypes.PodUpdate{Pods: s.MergedState().([]*v1.Pod), Op: kubetypes.SET, Source: source}
+		}
+		if len(updates.Pods) > 0 {
+			s.updates <- *updates
+		}
+		if len(deletes.Pods) > 0 {
+			s.updates <- *deletes
+		}
+
+	case PodConfigNotificationSnapshot:
+		if len(updates.Pods) > 0 || len(deletes.Pods) > 0 || len(adds.Pods) > 0 || len(removes.Pods) > 0 || firstSet {
+			s.updates <- kubetypes.PodUpdate{Pods: s.MergedState().([]*v1.Pod), Op: kubetypes.SET, Source: source}
+		}
+
+	case PodConfigNotificationUnknown:
+		fallthrough
+	default:
+		panic(fmt.Sprintf("unsupported PodConfigNotificationMode: %#v", s.mode))
+	}
+
+	return nil
+}
+```
+看```adds, updates, deletes, removes, reconciles, restores := s.merge(source, change)```
+
+``` 
+func (s *podStorage) merge(source string, change interface{}) (adds, updates, deletes, removes, reconciles, restores *kubetypes.PodUpdate) {
+	s.podLock.Lock()
+	defer s.podLock.Unlock()
+
+	addPods := []*v1.Pod{}
+	updatePods := []*v1.Pod{}
+	deletePods := []*v1.Pod{}
+	removePods := []*v1.Pod{}
+	reconcilePods := []*v1.Pod{}
+	restorePods := []*v1.Pod{}
+
+	pods := s.pods[source]
+	if pods == nil {
+		pods = make(map[types.UID]*v1.Pod)
+	}
+
+	// updatePodFunc is the local function which updates the pod cache *oldPods* with new pods *newPods*.
+	// After updated, new pod will be stored in the pod cache *pods*.
+	// Notice that *pods* and *oldPods* could be the same cache.
+	updatePodsFunc := func(newPods []*v1.Pod, oldPods, pods map[types.UID]*v1.Pod) {
+		filtered := filterInvalidPods(newPods, source, s.recorder)
+		for _, ref := range filtered {
+			// Annotate the pod with the source before any comparison.
+			if ref.Annotations == nil {
+				ref.Annotations = make(map[string]string)
+			}
+			ref.Annotations[kubetypes.ConfigSourceAnnotationKey] = source
+			if existing, found := oldPods[ref.UID]; found {
+				pods[ref.UID] = existing
+				needUpdate, needReconcile, needGracefulDelete := checkAndUpdatePod(existing, ref)
+				if needUpdate {
+					updatePods = append(updatePods, existing)
+				} else if needReconcile {
+					reconcilePods = append(reconcilePods, existing)
+				} else if needGracefulDelete {
+					deletePods = append(deletePods, existing)
+				}
+				continue
+			}
+			recordFirstSeenTime(ref)
+			pods[ref.UID] = ref
+			addPods = append(addPods, ref)
+		}
+	}
+
+	update := change.(kubetypes.PodUpdate)
+	switch update.Op {
+	case kubetypes.ADD, kubetypes.UPDATE, kubetypes.DELETE:
+		if update.Op == kubetypes.ADD {
+			glog.V(4).Infof("Adding new pods from source %s : %v", source, update.Pods)
+		} else if update.Op == kubetypes.DELETE {
+			glog.V(4).Infof("Graceful deleting pods from source %s : %v", source, update.Pods)
+		} else {
+			glog.V(4).Infof("Updating pods from source %s : %v", source, update.Pods)
+		}
+		updatePodsFunc(update.Pods, pods, pods)
+
+	case kubetypes.REMOVE:
+		glog.V(4).Infof("Removing pods from source %s : %v", source, update.Pods)
+		for _, value := range update.Pods {
+			if existing, found := pods[value.UID]; found {
+				// this is a delete
+				delete(pods, value.UID)
+				removePods = append(removePods, existing)
+				continue
+			}
+			// this is a no-op
+		}
+
+	case kubetypes.SET:
+		glog.V(4).Infof("Setting pods for source %s", source)
+		s.markSourceSet(source)
+		// Clear the old map entries by just creating a new map
+		oldPods := pods
+		pods = make(map[types.UID]*v1.Pod)
+		updatePodsFunc(update.Pods, oldPods, pods)
+		for uid, existing := range oldPods {
+			if _, found := pods[uid]; !found {
+				// this is a delete
+				removePods = append(removePods, existing)
+			}
+		}
+	case kubetypes.RESTORE:
+		glog.V(4).Infof("Restoring pods for source %s", source)
+		for _, value := range update.Pods {
+			restorePods = append(restorePods, value)
+		}
+
+	default:
+		glog.Warningf("Received invalid update type: %v", update)
+
+	}
+
+	s.pods[source] = pods
+
+	adds = &kubetypes.PodUpdate{Op: kubetypes.ADD, Pods: copyPods(addPods), Source: source}
+	updates = &kubetypes.PodUpdate{Op: kubetypes.UPDATE, Pods: copyPods(updatePods), Source: source}
+	deletes = &kubetypes.PodUpdate{Op: kubetypes.DELETE, Pods: copyPods(deletePods), Source: source}
+	removes = &kubetypes.PodUpdate{Op: kubetypes.REMOVE, Pods: copyPods(removePods), Source: source}
+	reconciles = &kubetypes.PodUpdate{Op: kubetypes.RECONCILE, Pods: copyPods(reconcilePods), Source: source}
+	restores = &kubetypes.PodUpdate{Op: kubetypes.RESTORE, Pods: copyPods(restorePods), Source: source}
+
+	return adds, updates, deletes, removes, reconciles, restores
+}
+```
+上边的逻辑会过将不同source过来的数据放到一个map里,并且过滤重复的请求,并保证发送的数据的顺序
+
+
+然后看创建Source
+
 ```
 func NewSourceFile(path string, nodeName types.NodeName, period time.Duration, updates chan<- interface{}) {
 	// "golang.org/x/exp/inotify" requires a path without trailing "/"
@@ -917,3 +1151,325 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 ```
 上边的操作会对拿到的Pods数据进行组织并且推送到updates channel
 这些updates channel到底如何消费呢?
+
+RunKubelet() -> CreateAndInitKubelet() -> NewMainKubelet() -> makePodSourceConfig()
+
+回头看 [RunKubelet()](cmd/kubelet/app/server.go#L932)
+
+从上边的过程得知已经创建好kubelet想要运行时所依赖的各种组件,下边看启动的情况
+
+``` 
+k, err := CreateAndInitKubelet(&kubeServer.KubeletConfiguration,
+		...
+		)
+	if err != nil {
+		return fmt.Errorf("failed to create kubelet: %v", err)
+	}
+
+	// NewMainKubelet should have set up a pod source config if one didn't exist
+	// when the builder was run. This is just a precaution.
+	if kubeDeps.PodConfig == nil {
+		return fmt.Errorf("failed to create kubelet, pod source config was nil")
+	}
+	podCfg := kubeDeps.PodConfig
+
+	rlimit.RlimitNumFiles(uint64(kubeServer.MaxOpenFiles))
+
+	// process pods and exit.
+	if runOnce {
+		if _, err := k.RunOnce(podCfg.Updates()); err != nil {
+			return fmt.Errorf("runonce failed: %v", err)
+		}
+		glog.Infof("Started kubelet as runonce")
+	} else {
+		startKubelet(k, podCfg, &kubeServer.KubeletConfiguration, kubeDeps, kubeServer.EnableServer)
+		glog.Infof("Started kubelet")
+	}
+	return nil
+}
+```
+
+浏览 ```startKubelet()```
+
+``` 
+func startKubelet(k kubelet.Bootstrap, podCfg *config.PodConfig, kubeCfg *kubeletconfiginternal.KubeletConfiguration, kubeDeps *kubelet.Dependencies, enableServer bool) {
+	// start the kubelet
+	go wait.Until(func() {
+		k.Run(podCfg.Updates())
+	}, 0, wait.NeverStop)
+
+	// start the kubelet server
+	if enableServer {
+		go k.ListenAndServe(net.ParseIP(kubeCfg.Address), uint(kubeCfg.Port), kubeDeps.TLSOptions, kubeDeps.Auth, kubeCfg.EnableDebuggingHandlers, kubeCfg.EnableContentionProfiling)
+
+	}
+	if kubeCfg.ReadOnlyPort > 0 {
+		go k.ListenAndServeReadOnly(net.ParseIP(kubeCfg.Address), uint(kubeCfg.ReadOnlyPort))
+	}
+}
+```
+
+看 ```k.Run(pdCfg.Updates())```
+
+``` 
+// Run starts the kubelet reacting to config updates
+func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
+	if kl.logServer == nil {
+		kl.logServer = http.StripPrefix("/logs/", http.FileServer(http.Dir("/var/log/")))
+	}
+	if kl.kubeClient == nil {
+		glog.Warning("No api server defined - no node status update will be sent.")
+	}
+
+	// Start the cloud provider sync manager
+	if kl.cloudResourceSyncManager != nil {
+		go kl.cloudResourceSyncManager.Run(wait.NeverStop)
+	}
+
+	if err := kl.initializeModules(); err != nil {
+		kl.recorder.Eventf(kl.nodeRef, v1.EventTypeWarning, events.KubeletSetupFailed, err.Error())
+		glog.Fatal(err)
+	}
+
+	// Start volume manager
+	go kl.volumeManager.Run(kl.sourcesReady, wait.NeverStop)
+
+	if kl.kubeClient != nil {
+		// Start syncing node status immediately, this may set up things the runtime needs to run.
+		go wait.Until(kl.syncNodeStatus, kl.nodeStatusUpdateFrequency, wait.NeverStop)
+	}
+	go wait.Until(kl.updateRuntimeUp, 5*time.Second, wait.NeverStop)
+
+	// Start loop to sync iptables util rules
+	if kl.makeIPTablesUtilChains {
+		go wait.Until(kl.syncNetworkUtil, 1*time.Minute, wait.NeverStop)
+	}
+
+	// Start a goroutine responsible for killing pods (that are not properly
+	// handled by pod workers).
+	go wait.Until(kl.podKiller, 1*time.Second, wait.NeverStop)
+
+	// Start component sync loops.
+	kl.statusManager.Start()
+	kl.probeManager.Start()
+
+	// Start the pod lifecycle event generator.
+	kl.pleg.Start()
+	kl.syncLoop(updates, kl)
+}
+```
+传入的参数是Updates channel
+
+``` 
+    if kl.kubeClient != nil {
+		// Start syncing node status immediately, this may set up things the runtime needs to run.
+		go wait.Until(kl.syncNodeStatus, kl.nodeStatusUpdateFrequency, wait.NeverStop)
+	}
+```
+
+kl.syncNodeStatus 这里是注册和心跳的逻辑,后续详细介绍
+
+``` 
+// syncNodeStatus should be called periodically from a goroutine.
+// It synchronizes node status to master, registering the kubelet first if
+// necessary.
+func (kl *Kubelet) syncNodeStatus() {
+	if kl.kubeClient == nil || kl.heartbeatClient == nil {
+		return
+	}
+	if kl.registerNode {
+		// This will exit immediately if it doesn't need to do anything.
+		kl.registerWithAPIServer()
+	}
+	if err := kl.updateNodeStatus(); err != nil {
+		glog.Errorf("Unable to update node status: %v", err)
+	}
+}
+```
+直接看 kl.syncLoop(updates, kl)
+
+``` 
+
+// syncLoop is the main loop for processing changes. It watches for changes from
+// three channels (file, apiserver, and http) and creates a union of them. For
+// any new change seen, will run a sync against desired state and running state. If
+// no changes are seen to the configuration, will synchronize the last known desired
+// state every sync-frequency seconds. Never returns.
+func (kl *Kubelet) syncLoop(updates <-chan kubetypes.PodUpdate, handler SyncHandler) {
+	glog.Info("Starting kubelet main sync loop.")
+	// The resyncTicker wakes up kubelet to checks if there are any pod workers
+	// that need to be sync'd. A one-second period is sufficient because the
+	// sync interval is defaulted to 10s.
+	syncTicker := time.NewTicker(time.Second)
+	defer syncTicker.Stop()
+	housekeepingTicker := time.NewTicker(housekeepingPeriod)
+	defer housekeepingTicker.Stop()
+	plegCh := kl.pleg.Watch()
+	const (
+		base   = 100 * time.Millisecond
+		max    = 5 * time.Second
+		factor = 2
+	)
+	duration := base
+	for {
+		if rs := kl.runtimeState.runtimeErrors(); len(rs) != 0 {
+			glog.Infof("skipping pod synchronization - %v", rs)
+			// exponential backoff
+			time.Sleep(duration)
+			duration = time.Duration(math.Min(float64(max), factor*float64(duration)))
+			continue
+		}
+		// reset backoff if we have a success
+		duration = base
+
+		kl.syncLoopMonitor.Store(kl.clock.Now())
+		if !kl.syncLoopIteration(updates, handler, syncTicker.C, housekeepingTicker.C, plegCh) {
+			break
+		}
+		kl.syncLoopMonitor.Store(kl.clock.Now())
+	}
+}
+
+// syncLoopIteration reads from various channels and dispatches pods to the
+// given handler.
+//
+// Arguments:
+// 1.  configCh:       a channel to read config events from
+// 2.  handler:        the SyncHandler to dispatch pods to
+// 3.  syncCh:         a channel to read periodic sync events from
+// 4.  houseKeepingCh: a channel to read housekeeping events from
+// 5.  plegCh:         a channel to read PLEG updates from
+//
+// Events are also read from the kubelet liveness manager's update channel.
+//
+// The workflow is to read from one of the channels, handle that event, and
+// update the timestamp in the sync loop monitor.
+//
+// Here is an appropriate place to note that despite the syntactical
+// similarity to the switch statement, the case statements in a select are
+// evaluated in a pseudorandom order if there are multiple channels ready to
+// read from when the select is evaluated.  In other words, case statements
+// are evaluated in random order, and you can not assume that the case
+// statements evaluate in order if multiple channels have events.
+//
+// With that in mind, in truly no particular order, the different channels
+// are handled as follows:
+//
+// * configCh: dispatch the pods for the config change to the appropriate
+//             handler callback for the event type
+// * plegCh: update the runtime cache; sync pod
+// * syncCh: sync all pods waiting for sync
+// * houseKeepingCh: trigger cleanup of pods
+// * liveness manager: sync pods that have failed or in which one or more
+//                     containers have failed liveness checks
+func (kl *Kubelet) syncLoopIteration(configCh <-chan kubetypes.PodUpdate, handler SyncHandler,
+	syncCh <-chan time.Time, housekeepingCh <-chan time.Time, plegCh <-chan *pleg.PodLifecycleEvent) bool {
+	select {
+	case u, open := <-configCh:
+		// Update from a config source; dispatch it to the right handler
+		// callback.
+		if !open {
+			glog.Errorf("Update channel is closed. Exiting the sync loop.")
+			return false
+		}
+
+		switch u.Op {
+		case kubetypes.ADD:
+			glog.V(2).Infof("SyncLoop (ADD, %q): %q", u.Source, format.Pods(u.Pods))
+			// After restarting, kubelet will get all existing pods through
+			// ADD as if they are new pods. These pods will then go through the
+			// admission process and *may* be rejected. This can be resolved
+			// once we have checkpointing.
+			handler.HandlePodAdditions(u.Pods)
+		case kubetypes.UPDATE:
+			glog.V(2).Infof("SyncLoop (UPDATE, %q): %q", u.Source, format.PodsWithDeletiontimestamps(u.Pods))
+			handler.HandlePodUpdates(u.Pods)
+		case kubetypes.REMOVE:
+			glog.V(2).Infof("SyncLoop (REMOVE, %q): %q", u.Source, format.Pods(u.Pods))
+			handler.HandlePodRemoves(u.Pods)
+		case kubetypes.RECONCILE:
+			glog.V(4).Infof("SyncLoop (RECONCILE, %q): %q", u.Source, format.Pods(u.Pods))
+			handler.HandlePodReconcile(u.Pods)
+		case kubetypes.DELETE:
+			glog.V(2).Infof("SyncLoop (DELETE, %q): %q", u.Source, format.Pods(u.Pods))
+			// DELETE is treated as a UPDATE because of graceful deletion.
+			handler.HandlePodUpdates(u.Pods)
+		case kubetypes.RESTORE:
+			glog.V(2).Infof("SyncLoop (RESTORE, %q): %q", u.Source, format.Pods(u.Pods))
+			// These are pods restored from the checkpoint. Treat them as new
+			// pods.
+			handler.HandlePodAdditions(u.Pods)
+		case kubetypes.SET:
+			// TODO: Do we want to support this?
+			glog.Errorf("Kubelet does not support snapshot update")
+		}
+
+		if u.Op != kubetypes.RESTORE {
+			// If the update type is RESTORE, it means that the update is from
+			// the pod checkpoints and may be incomplete. Do not mark the
+			// source as ready.
+
+			// Mark the source ready after receiving at least one update from the
+			// source. Once all the sources are marked ready, various cleanup
+			// routines will start reclaiming resources. It is important that this
+			// takes place only after kubelet calls the update handler to process
+			// the update to ensure the internal pod cache is up-to-date.
+			kl.sourcesReady.AddSource(u.Source)
+		}
+	case e := <-plegCh:
+		if isSyncPodWorthy(e) {
+			// PLEG event for a pod; sync it.
+			if pod, ok := kl.podManager.GetPodByUID(e.ID); ok {
+				glog.V(2).Infof("SyncLoop (PLEG): %q, event: %#v", format.Pod(pod), e)
+				handler.HandlePodSyncs([]*v1.Pod{pod})
+			} else {
+				// If the pod no longer exists, ignore the event.
+				glog.V(4).Infof("SyncLoop (PLEG): ignore irrelevant event: %#v", e)
+			}
+		}
+
+		if e.Type == pleg.ContainerDied {
+			if containerID, ok := e.Data.(string); ok {
+				kl.cleanUpContainersInPod(e.ID, containerID)
+			}
+		}
+	case <-syncCh:
+		// Sync pods waiting for sync
+		podsToSync := kl.getPodsToSync()
+		if len(podsToSync) == 0 {
+			break
+		}
+		glog.V(4).Infof("SyncLoop (SYNC): %d pods; %s", len(podsToSync), format.Pods(podsToSync))
+		handler.HandlePodSyncs(podsToSync)
+	case update := <-kl.livenessManager.Updates():
+		if update.Result == proberesults.Failure {
+			// The liveness manager detected a failure; sync the pod.
+
+			// We should not use the pod from livenessManager, because it is never updated after
+			// initialization.
+			pod, ok := kl.podManager.GetPodByUID(update.PodUID)
+			if !ok {
+				// If the pod no longer exists, ignore the update.
+				glog.V(4).Infof("SyncLoop (container unhealthy): ignore irrelevant update: %#v", update)
+				break
+			}
+			glog.V(1).Infof("SyncLoop (container unhealthy): %q", format.Pod(pod))
+			handler.HandlePodSyncs([]*v1.Pod{pod})
+		}
+	case <-housekeepingCh:
+		if !kl.sourcesReady.AllReady() {
+			// If the sources aren't ready or volume manager has not yet synced the states,
+			// skip housekeeping, as we may accidentally delete pods from unready sources.
+			glog.V(4).Infof("SyncLoop (housekeeping, skipped): sources aren't ready yet.")
+		} else {
+			glog.V(4).Infof("SyncLoop (housekeeping)")
+			if err := handler.HandlePodCleanups(); err != nil {
+				glog.Errorf("Failed cleaning pods: %v", err)
+			}
+		}
+	}
+	return true
+}
+
+```
+以上是Updates的处理过程,待以后详细展开
