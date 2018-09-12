@@ -670,6 +670,290 @@ qos_container_manager_linux.go#L128
 
 rootContainer 查看之后发现从配置里来 默认是空的
 
-所以返回的 ```m.cgroupManager.Name(cgroupName)``` cgroup_manager_linux.go , 应该是个空字符串
+所以返回的 ```m.cgroupManager.Name(cgroupName)``` cgroup_manager_linux.go , 应该是个[空字符串 , podContainer]
 
 回到 ```func (m *kubeGenericRuntimeManager) generatePodSandboxLinuxConfig(pod *v1.Pod) (*runtimeapi.LinuxPodSandboxConfig, error) ``` kuberuntime_sendbox.go#L129
+
+这个方法里设置了所有Linux相关的设置
+
+```
+// generatePodSandboxLinuxConfig generates LinuxPodSandboxConfig from v1.Pod.
+func (m *kubeGenericRuntimeManager) generatePodSandboxLinuxConfig(pod *v1.Pod) (*runtimeapi.LinuxPodSandboxConfig, error) {
+	cgroupParent := m.runtimeHelper.GetPodCgroupParent(pod)
+	lc := &runtimeapi.LinuxPodSandboxConfig{
+		CgroupParent: cgroupParent,
+		SecurityContext: &runtimeapi.LinuxSandboxSecurityContext{
+			Privileged:         kubecontainer.HasPrivilegedContainer(pod),
+			SeccompProfilePath: m.getSeccompProfileFromAnnotations(pod.Annotations, ""),
+		},
+	}
+
+	sysctls := make(map[string]string)
+	if utilfeature.DefaultFeatureGate.Enabled(features.Sysctls) {
+		if pod.Spec.SecurityContext != nil {
+			for _, c := range pod.Spec.SecurityContext.Sysctls {
+				sysctls[c.Name] = c.Value
+			}
+		}
+	}
+
+	lc.Sysctls = sysctls
+
+	if pod.Spec.SecurityContext != nil {
+		sc := pod.Spec.SecurityContext
+		if sc.RunAsUser != nil {
+			lc.SecurityContext.RunAsUser = &runtimeapi.Int64Value{Value: int64(*sc.RunAsUser)}
+		}
+		if sc.RunAsGroup != nil {
+			lc.SecurityContext.RunAsGroup = &runtimeapi.Int64Value{Value: int64(*sc.RunAsGroup)}
+		}
+		lc.SecurityContext.NamespaceOptions = namespacesForPod(pod)
+
+		if sc.FSGroup != nil {
+			lc.SecurityContext.SupplementalGroups = append(lc.SecurityContext.SupplementalGroups, int64(*sc.FSGroup))
+		}
+		if groups := m.runtimeHelper.GetExtraSupplementalGroupsForPod(pod); len(groups) > 0 {
+			lc.SecurityContext.SupplementalGroups = append(lc.SecurityContext.SupplementalGroups, groups...)
+		}
+		if sc.SupplementalGroups != nil {
+			for _, sg := range sc.SupplementalGroups {
+				lc.SecurityContext.SupplementalGroups = append(lc.SecurityContext.SupplementalGroups, int64(sg))
+			}
+		}
+		if sc.SELinuxOptions != nil {
+			lc.SecurityContext.SelinuxOptions = &runtimeapi.SELinuxOption{
+				User:  sc.SELinuxOptions.User,
+				Role:  sc.SELinuxOptions.Role,
+				Type:  sc.SELinuxOptions.Type,
+				Level: sc.SELinuxOptions.Level,
+			}
+		}
+	}
+
+	return lc, nil
+}
+```
+
+回来继续看 generatePodSandboxConfig() 生成好的 lc, err := m.generatePodSandboxLinuxConfig(pod)
+
+赋值给了podSandboxConfig
+
+然后退回看createPodSandbox()
+```
+// createPodSandbox creates a pod sandbox and returns (podSandBoxID, message, error).
+func (m *kubeGenericRuntimeManager) createPodSandbox(pod *v1.Pod, attempt uint32) (string, string, error) {
+	podSandboxConfig, err := m.generatePodSandboxConfig(pod, attempt)
+	if err != nil {
+		message := fmt.Sprintf("GeneratePodSandboxConfig for pod %q failed: %v", format.Pod(pod), err)
+		glog.Error(message)
+		return "", message, err
+	}
+
+	// Create pod logs directory
+	err = m.osInterface.MkdirAll(podSandboxConfig.LogDirectory, 0755)
+	if err != nil {
+		message := fmt.Sprintf("Create pod log directory for pod %q failed: %v", format.Pod(pod), err)
+		glog.Errorf(message)
+		return "", message, err
+	}
+    // 调用Rpc请求 创建sandbox
+	podSandBoxID, err := m.runtimeService.RunPodSandbox(podSandboxConfig)
+	if err != nil {
+		message := fmt.Sprintf("CreatePodSandbox for pod %q failed: %v", format.Pod(pod), err)
+		glog.Error(message)
+		return "", message, err
+	}
+
+	return podSandBoxID, "", nil
+}
+```
+这个 ```podSandBoxID, err := m.runtimeService.RunPodSandbox(podSandboxConfig)```
+
+会调用[remote_runtime.go](pkg/kubelet/remote/remote_runtime.go#L81)
+
+请求的是docker shim的服务 具体启动流程从 [cmd/kubelet/app/server.go](cmd/kubelet/app/server.go#L250)开始
+
+最总代码可以直接看dockerservice
+
+继续看 dockerservice.RunPodSandbox()
+
+这里会创建 Container 设置网络等
+
+这个PodSandboxId 就是 创建的ContainerID
+
+Sandbox创建完成 回头继续看 [SyncPod()](pkg/kubelet/kuberuntime/kuberuntime_manager.go#L643)
+
+目前为止SandboxID拿到pod创建成功继续看下边
+
+```
+   // Get podSandboxConfig for containers to start.
+   	....
+   	podSandboxConfig, err := m.generatePodSandboxConfig(pod, podContainerChanges.Attempt)
+```
+这里会创建一个podSandboxConfig用来为后来的container做准备
+
+```
+
+// generatePodSandboxConfig generates pod sandbox config from v1.Pod.
+func (m *kubeGenericRuntimeManager) generatePodSandboxConfig(pod *v1.Pod, attempt uint32) (*runtimeapi.PodSandboxConfig, error) {
+	// TODO: deprecating podsandbox resource requirements in favor of the pod level cgroup
+	// Refer https://github.com/kubernetes/kubernetes/issues/29871
+	podUID := string(pod.UID)
+	podSandboxConfig := &runtimeapi.PodSandboxConfig{
+		....
+	}
+
+	.....
+
+	portMappings := []*runtimeapi.PortMapping{}
+	for _, c := range pod.Spec.Containers {
+		containerPortMappings := kubecontainer.MakePortMappings(&c)
+
+		for idx := range containerPortMappings {
+			.....
+			.....
+		}
+
+	}
+	if len(portMappings) > 0 {
+		podSandboxConfig.PortMappings = portMappings
+	}
+
+    //看这里
+	lc, err := m.generatePodSandboxLinuxConfig(pod)
+	if err != nil {
+		return nil, err
+	}
+	podSandboxConfig.Linux = lc
+
+	return podSandboxConfig, nil
+}
+```
+这个 ```lc, err := m.generatePodSandboxLinuxConfig(pod)```会
+跟之前创建Pod的时候一样,所以这个cgroupparent 会是 pod的 cgroup
+
+往后接着看  [start the init container.](pkg/kubelet/kuberuntime/kuberuntime_manager.go#L689)
+
+这里是启动 init-containers的逻辑看到
+
+```
+        if msg, err := m.startContainer(podSandboxID, podSandboxConfig, container, pod, podStatus, pullSecrets, podIP, kubecontainer.ContainerTypeInit); err != nil {
+			startContainerResult.Fail(err, msg)
+			utilruntime.HandleError(fmt.Errorf("init container start failed: %v: %s", err, msg))
+			return
+		}
+```
+进入方法
+
+```
+// startContainer starts a container and returns a message indicates why it is failed on error.
+// It starts the container through the following steps:
+// * pull the image
+// * create the container
+// * start the container
+// * run the post start lifecycle hooks (if applicable)
+func (m *kubeGenericRuntimeManager) startContainer(podSandboxID string, podSandboxConfig *runtimeapi.PodSandboxConfig, container *v1.Container, pod *v1.Pod, podStatus *kubecontainer.PodStatus, pullSecrets []v1.Secret, podIP string, containerType kubecontainer.ContainerType) (string, error) {
+	// Step 1: pull the image.
+	imageRef, msg, err := m.imagePuller.EnsureImageExists(pod, container, pullSecrets)
+	.....
+
+	// Step 2: create the container.
+	ref, err := kubecontainer.GenerateContainerRef(pod, container)
+	.....
+
+	// For a new container, the RestartCount should be 0
+	.....
+    // 构建创建需要的config
+	containerConfig, cleanupAction, err := m.generateContainerConfig(container, pod, restartCount, podIP, imageRef, containerType)
+	......
+
+    //开始创建Container 这里还是 [remote_runtime.go](pkg/kubelet/remote/remote_runtime.go#L177)
+	containerID, err := m.runtimeService.CreateContainer(podSandboxID, containerConfig, podSandboxConfig)
+	if err != nil {
+		m.recordContainerEvent(pod, container, containerID, v1.EventTypeWarning, events.FailedToCreateContainer, "Error: %v", grpc.ErrorDesc(err))
+		return grpc.ErrorDesc(err), ErrCreateContainer
+	}
+	// 执行Hook
+	err = m.internalLifecycle.PreStartContainer(pod, container, containerID)
+	......
+	m.recordContainerEvent(pod, container, containerID, v1.EventTypeNormal, events.CreatedContainer, "Created container")
+
+	......
+
+	// Step 3: start the container.
+	err = m.runtimeService.StartContainer(containerID)
+    .....
+	// Symlink container logs to the legacy container log location for cluster logging
+	// support.
+	// TODO(random-liu): Remove this after cluster logging supports CRI container log path.
+	containerMeta := containerConfig.GetMetadata()
+	sandboxMeta := podSandboxConfig.GetMetadata()
+	legacySymlink := legacyLogSymlink(containerID, containerMeta.Name, sandboxMeta.Name,
+		sandboxMeta.Namespace)
+	containerLog := filepath.Join(podSandboxConfig.LogDirectory, containerConfig.LogPath)
+	// only create legacy symlink if containerLog path exists (or the error is not IsNotExist).
+	// Because if containerLog path does not exist, only dandling legacySymlink is created.
+	// This dangling legacySymlink is later removed by container gc, so it does not make sense
+	// to create it in the first place. it happens when journald logging driver is used with docker.
+	if _, err := m.osInterface.Stat(containerLog); !os.IsNotExist(err) {
+		if err := m.osInterface.Symlink(containerLog, legacySymlink); err != nil {
+			glog.Errorf("Failed to create legacy symbolic link %q to container %q log %q: %v",
+				legacySymlink, containerID, containerLog, err)
+		}
+	}
+
+	// Step 4: execute the post start hook.
+	if container.Lifecycle != nil && container.Lifecycle.PostStart != nil {
+		kubeContainerID := kubecontainer.ContainerID{
+			Type: m.runtimeName,
+			ID:   containerID,
+		}
+		msg, handlerErr := m.runner.Run(kubeContainerID, pod, container, container.Lifecycle.PostStart)
+		if handlerErr != nil {
+			m.recordContainerEvent(pod, container, kubeContainerID.ID, v1.EventTypeWarning, events.FailedPostStartHook, msg)
+			if err := m.killContainer(pod, kubeContainerID, container.Name, "FailedPostStartHook", nil); err != nil {
+				glog.Errorf("Failed to kill container %q(id=%q) in pod %q: %v, %v",
+					container.Name, kubeContainerID.String(), format.Pod(pod), ErrPostStartHook, err)
+			}
+			return msg, fmt.Errorf("%s: %v", ErrPostStartHook, handlerErr)
+		}
+	}
+
+	return "", nil
+}
+```
+创建Container阶段调用的是remote_service的接口,实际上调用的是[dockerservice](pkg/kubelet/dockershim/docker_container.go#L88)
+
+前期准备掠过,主要看 err = ds.updateCreateConfig(&createConfig, config, sandboxConfig, podSandboxID, securityOptSeparator, apiVersion)
+
+这里会调用[helpers_linux.go](pkg/kubelet/dockershim/helpers_linux.go#L96) updateCreateConfig()
+
+```
+    // Apply cgroupsParent derived from the sandbox config.
+	if lc := sandboxConfig.GetLinux(); lc != nil {
+		// Apply Cgroup options.
+		cgroupParent, err := ds.GenerateExpectedCgroupParent(lc.CgroupParent)
+		if err != nil {
+			return fmt.Errorf("failed to generate cgroup parent in expected syntax for container %q: %v", config.Metadata.Name, err)
+		}
+		createConfig.HostConfig.CgroupParent = cgroupParent
+	}
+```
+这里的 sandboxConfig.GetLinux() 就是之前创建的linuxConfig
+
+看这个
+```
+    // Apply cgroupsParent derived from the sandbox config.
+	if lc := sandboxConfig.GetLinux(); lc != nil {
+		// Apply Cgroup options.
+		cgroupParent, err := ds.GenerateExpectedCgroupParent(lc.CgroupParent)
+		if err != nil {
+			return fmt.Errorf("failed to generate cgroup parent in expected syntax for container %q: %v", config.Metadata.Name, err)
+		}
+		createConfig.HostConfig.CgroupParent = cgroupParent
+	}
+```
+这里就关联上了pod -> containers 的cgroup
+
+
+
