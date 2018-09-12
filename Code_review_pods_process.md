@@ -4,6 +4,7 @@
 
 就目前版本来看,kubernetes的docker-shim将要分离成独立的binary做准备
 
+[k8s-pods](./k8s-pods.png)
 
 #### 主channel updates的处理
 
