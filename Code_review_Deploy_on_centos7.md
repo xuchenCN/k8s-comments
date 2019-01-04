@@ -105,9 +105,99 @@ Config Docker ```/etc/docker/daemon.json```
   }
 ```
 
-Install Etcd
+Config TLS
 
 ```
-sudo yum install -y etcd
+mkdir /etc/kubernetes
+```
+Install cfssl
+
+```
+$ wget https://pkg.cfssl.org/R1.2/cfssl_linux-amd64
+$ chmod +x cfssl_linux-amd64
+$ mv cfssl_linux-amd64 /usr/local/bin/cfssl
+$ wget https://pkg.cfssl.org/R1.2/cfssljson_linux-amd64
+$ chmod +x cfssljson_linux-amd64
+$ mv cfssljson_linux-amd64 /usr/local/bin/cfssljson
+$ wget https://pkg.cfssl.org/R1.2/cfssl-certinfo_linux-amd64
+$ chmod +x cfssl-certinfo_linux-amd64
+$ mv cfssl-certinfo_linux-amd64 /usr/local/bin/cfssl-certinfo
 ```
 
+$ vim ca-config.json
+
+```
+{
+  "signing": {
+    "default": {
+      "expiry": "8760h"
+    },
+    "profiles": {
+      "kubernetes": {
+        "usages": [
+          "signing",
+          "key encipherment",
+          "server auth",
+          "client auth"
+        ],
+        "expiry": "8760h"
+      }
+    }
+  }
+}
+```
+vim ca-csr.json
+
+```
+{
+  "CN": "kubernetes",
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names":[{
+    "C": "<country>",
+    "ST": "<state>",
+    "L": "<city>",
+    "O": "<organization>",
+    "OU": "<organization unit>"
+  }]
+}
+```
+
+Generate private key
+
+```
+cfssl gencert -initca ca-csr.json | cfssljson -bare ca
+```
+
+vim kubernetes-csr.json
+
+```
+{
+  "CN": "kubernetes",
+  "hosts": [
+    "127.0.0.1",
+    "<MASTER_IP>",
+    "<NODE1_IP>",
+    "<NODE2_IP>",
+    "<MASTER_CLUSTER_IP>(10.254.0.1)",
+    "kubernetes",
+    "kubernetes.default",
+    "kubernetes.default.svc",
+    "kubernetes.default.svc.cluster",
+    "kubernetes.default.svc.cluster.local"
+  ],
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [{
+    "C": "<country>",
+    "ST": "<state>",
+    "L": "<city>",
+    "O": "<organization>",
+    "OU": "<organization unit>"
+  }]
+}
+```
