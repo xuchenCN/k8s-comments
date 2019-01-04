@@ -124,6 +124,31 @@ $ chmod +x cfssl-certinfo_linux-amd64
 $ mv cfssl-certinfo_linux-amd64 /usr/local/bin/cfssl-certinfo
 ```
 
+Will generate certs 
+
+```
+ca-key.pem
+ca.pem
+kubernetes-key.pem
+kubernetes.pem
+kube-proxy.pem
+kube-proxy-key.pem
+admin.pem
+admin-key.pem
+```
+
+relations
+
+```
+etcd  ca.pem、kubernetes-key.pem、kubernetes.pem；
+kube-apiserver： ca.pem、kubernetes-key.pem、kubernetes.pem；
+kubelet： ca.pem；
+kube-proxy： ca.pem、kube-proxy-key.pem、kube-proxy.pem；
+kubectl： ca.pem、admin-key.pem、admin.pem；
+kube-controller-manager： ca-key.pem、ca.pem
+```
+
+
 $ vim ca-config.json
 
 ```
@@ -196,8 +221,123 @@ vim kubernetes-csr.json
     "C": "<country>",
     "ST": "<state>",
     "L": "<city>",
-    "O": "<organization>",
+    "O": "k8s",
     "OU": "<organization unit>"
   }]
 }
 ```
+vim admin-csr.json
+
+```
+{
+  "CN": "admin",
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names":[{
+    "C": "<country>",
+    "ST": "<state>",
+    "L": "<city>",
+    "O": "system:master",
+    "OU": "<organization unit>"
+  }]
+}
+```
+
+```
+$ cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes admin-csr.json | cfssljson -bare admin
+```
+
+vim kube-proxy-csr.json
+
+```
+{
+     "CN": "system:kube-proxy",
+     "hosts": [],
+     "key": {
+       "algo": "rsa",
+       "size": 2048
+     },
+"names": [ {
+         "C": "CN",
+         "ST": "HangZhoue",
+         "L": "HangZhoue",
+         "O": "k8s",
+         "OU": "System"
+} ]
+}
+```
+On all nodes ``` mkdir -p /etc/kubernetes/ssl/```
+Dispatch all pem files acorrding the relations to ```/etc/kubernetes/ssl/```
+
+
+```
+etcd  ca.pem、kubernetes-key.pem、kubernetes.pem；
+kube-apiserver： ca.pem、kubernetes-key.pem、kubernetes.pem；
+kubelet： ca.pem；
+kube-proxy： ca.pem、kube-proxy-key.pem、kube-proxy.pem；
+kubectl： ca.pem、admin-key.pem、admin.pem；
+kube-controller-manager： ca-key.pem、ca.pem
+```
+
+Install Etcd
+
+```
+wget https://github.com/coreos/etcd/releases/download/v3.2.1/etcd-v3.2.1-linux-amd64.tar.gz
+tar -xvf etcd-v3.2.1-linux-amd64.tar.gz
+etcd-v3.2.1-linux-amd64/etcd* /usr/bin
+```
+
+vim /etc/systemd/system/etcd.service
+
+```
+[Unit]
+Description=Etcd Server
+[Service]
+Type=notify
+WorkingDirectory=/data/etcd/
+EnvironmentFile=-/etc/etcd/etcd.conf
+ExecStart=/usr/bin/etcd \\
+  --name k8s-master \\
+  --cert-file=/etc/kubernetes/ssl/kubernetes.pem \\
+  --key-file=/etc/kubernetes/ssl/kubernetes-key.pem \\
+  --peer-cert-file=/etc/kubernetes/ssl/kubernetes.pem \\
+  --peer-key-file=/etc/kubernetes/ssl/kubernetes-key.pem \\
+  --trusted-ca-file=/etc/kubernetes/ssl/ca.pem \\
+  --peer-trusted-ca-file=/etc/kubernetes/ssl/ca.pem \\
+  --initial-advertise-peer-urls https://172.16.110.108:2380 \\
+  --listen-peer-urls https://172.16.110.108:2380 \\
+  --listen-client-urls https://172.16.110.108:2379,https://127.0.0.1:2379 \\
+  --advertise-client-urls https://172.16.110.108:2379 \\
+  --initial-cluster-token etcd-cluster-0 \\
+  --initial-cluster k8s-master=https://172.16.110.108:2380,k8s-node1=https://172.16.110.15:2380,k8s-node2=https://172.16.110.107:2380 \\
+  --initial-cluster-state new \\
+  --data-dir=/data/etcd
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+```
+
+```
+systemctl daemon-reload
+systemctl start etcd
+systemctl enable etcd
+```
+
+Make etcdctl alternatively file
+etcdctl_ssl
+
+```
+ETCDCTL_API=3 ./etcdctl     --endpoints https://xxxx:2379 --cacert /home/etcd_data/fixtures/client/cert.pem --cert  /home/etcd_data/fixtures/client/cert.pem  --key /home/etcd_data/fixtures/client/key.pem --dial-timeout=5s $@
+```
+
+etcdctl_ssl_v2
+
+```
+ETCDCTL_API=2 ./etcdctl     --endpoints https://xxxx:2379 --ca-file /home/etcd_data/fixtures/client/cert.pem --cert-file  /home/etcd_data/fixtures/client/cert.pem  --key-file /home/etcd_data/fixtures/client/key.pem  $@
+```
+
+
