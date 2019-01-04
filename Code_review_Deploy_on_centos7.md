@@ -331,13 +331,46 @@ Make etcdctl alternatively file
 etcdctl_ssl
 
 ```
-ETCDCTL_API=3 ./etcdctl     --endpoints https://xxxx:2379 --cacert /home/etcd_data/fixtures/client/cert.pem --cert  /home/etcd_data/fixtures/client/cert.pem  --key /home/etcd_data/fixtures/client/key.pem --dial-timeout=5s $@
+ETCDCTL_API=3 ./etcdctl --endpoints https://10.110.158.162:2379 --cacert /etc/kubernetes/ssl/ca.pem --cert  /etc/kubernetes/ssl/kubernetes.pem  --key /etc/kubernetes/ssl/kubernetes-key.pem --dial-timeout=5s $@
 ```
 
 etcdctl_ssl_v2
 
 ```
-ETCDCTL_API=2 ./etcdctl     --endpoints https://xxxx:2379 --ca-file /home/etcd_data/fixtures/client/cert.pem --cert-file  /home/etcd_data/fixtures/client/cert.pem  --key-file /home/etcd_data/fixtures/client/key.pem  $@
+ETCDCTL_API=2 ./etcdctl     --endpoints https://10.110.158.162:2379 --ca-file /etc/kubernetes/ssl/ca.pem --cert-file /etc/kubernetes/ssl/kubernetes.pem  --key-file /etc/kubernetes/ssl/kubernetes-key.pem  $@
+```
+
+Install flannel
+
+```
+yum install flannel
+```
+
+/usr/lib/systemd/system/flanneld.service
+
+```
+[Unit]
+Description=flannel
+After=network.target
+After=network-online.target
+Wants=network-online.target
+After=etcd.service
+Before=docker.service
+[Service]
+#EnvironmentFile=-/etc/sysconfig/flanneld
+ExecStart=/opt/flannel/flanneld -v=0 -etcd-prefix=/flannel/network --ip-masq --iface=eno1 --etcd-endpoints=https://10.110.158.162:2379 -etcd-cafile=/etc/kubernetes/ssl/ca.pem  -etcd-certfile=/etc/kubernetes/ssl/kubernetes.pem -etcd-keyfile=/etc/kubernetes/ssl/kubernetes-key.pem
+[Install]
+WantedBy=multi-user.target
+RequiredBy=docker.service
+```
+
+```
+./etcdctl_ssl_v2   mk /flannel/network/config '{"Network":"172.17.0.0/16"}'
+```
+
+```
+systemctl daemon-reload
+systemctl start flanneld
 ```
 
 
