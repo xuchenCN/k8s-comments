@@ -105,4 +105,9 @@ Config Docker ```/etc/docker/daemon.json```
   }
 ```
 
+Install Etcd
+
+```
+sudo yum install -y etcd
+```
 
