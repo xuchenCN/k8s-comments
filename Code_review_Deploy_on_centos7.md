@@ -373,4 +373,144 @@ systemctl daemon-reload
 systemctl start flanneld
 ```
 
+Config docker /usr/lib/systemd/system/docker.service
 
+```
+[Unit]
+Description=Docker Application Container Engine
+Documentation=https://docs.docker.com
+After=network-online.target firewalld.service flanneld.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+EnvironmentFile=-/run/flannel/subnet.env
+# the default is not to use systemd for cgroups because the delegate issues still
+# exists and systemd currently does not support the cgroup feature set required
+# for containers run by docker
+ExecStart=/usr/bin/dockerd --bip=${FLANNEL_SUBNET} --mtu=${FLANNEL_MTU}
+ExecReload=/bin/kill -s HUP $MAINPID
+# Having non-zero Limit*s causes performance problems due to accounting overhead
+# in the kernel. We recommend using cgroups to do container-local accounting.
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+# Uncomment TasksMax if your systemd version supports it.
+# Only systemd 226 and above support this version.
+#TasksMax=infinity
+TimeoutStartSec=0
+# set delegate yes so that systemd does not reset the cgroups of docker containers
+Delegate=yes
+# kill only the docker process, not all processes in the cgroup
+KillMode=process
+# restart the docker process if it exits prematurely
+Restart=on-failure
+StartLimitBurst=3
+StartLimitInterval=60s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Don't forget ``` systemctl daemon-reload ```
+
+Install kubernetes from source code 
+
+```
+git clone https://github.com/kubernetes/kubernetes.git
+```
+
+[Install Go](https://golang.org/doc/install) if needed
+
+```
+cd kubernetes
+make
+```
+After make find commands from ```_output``` directory
+
+Set  ```_output``` directory to ```PATH``` eniroments
+
+Create kubeconfig
+
+```
+#set cluster
+kubectl config set-cluster kubernetes \
+  --certificate-authority=/etc/kubernetes/ssl/ca.pem \
+  --embed-certs=true \
+  --server="https://172.16.110.108:6443"
+#set credentials
+kubectl config set-credentials admin \
+  --client-certificate=/etc/kubernetes/ssl/admin.pem \
+  --embed-certs=true \
+  --client-key=/etc/kubernetes/ssl/admin-key.pem
+#set context
+kubectl config set-context kubernetes \
+  --cluster=kubernetes \
+  --user=admin
+#set defualt context
+kubectl config use-context kubernetes
+```
+Generate token [link](https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet-tls-bootstrapping/)
+
+```
+head -c 16 /dev/urandom | od -An -t x | tr -d ' '
+```
+
+vim token.csv
+
+```
+<token>,kubelet-bootstrap,10001,"system:node"
+```
+
+mv token.csv /etc/kubernetes/
+
+vim /usr/lib/systemd/system/kube-apiserver.service
+
+```
+[Unit]
+  Description=Kubernetes API Service
+  Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+  After=network.target
+  After=etcd.service
+[Service]
+  EnvironmentFile=-/etc/kubernetes/config
+  EnvironmentFile=-/etc/kubernetes/apiserver
+  ExecStart=/root/k8s/cmd/kube-apiserver \
+          $KUBE_LOGTOSTDERR \
+          $KUBE_LOG_LEVEL \
+          $KUBE_ETCD_SERVERS \
+          $KUBE_API_ADDRESS \
+          $KUBE_API_PORT \
+          $KUBELET_PORT \
+          $KUBE_ALLOW_PRIV \
+          $KUBE_SERVICE_ADDRESSES \
+          $KUBE_ADMISSION_CONTROL \
+          $KUBE_API_ARGS
+  Restart=on-failure
+  Type=notify
+  LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+```
+
+vim /etc/kubernetes/config
+
+```
+KUBE_LOGTOSTDERR="--logtostderr=true"
+KUBE_LOG_LEVEL="--v=0"
+KUBE_ALLOW_PRIV="--allow-privileged=true"
+KUBE_MASTER="--master=http://<master_ip>:8080"
+```
+
+vim /etc/kubernetes/apiserver
+
+```
+KUBE_API_ADDRESS="--advertise-address=10.110.158.162 --bind-address=10.110.158.162 --insecure-bind-address=10.110.158.162"
+KUBE_ETCD_SERVERS="--etcd-servers=https://10.110.158.162:2379"
+KUBE_SERVICE_ADDRESSES="--service-cluster-ip-range=10.254.0.0/16"
+KUBE_ADMISSION_CONTROL="--admission-control=ServiceAccount,NamespaceLifecycle,NamespaceExists,LimitRanger,ResourceQuota"
+KUBE_API_ARGS="--authorization-mode=RBAC --runtime-config=rbac.authorization.k8s.io/v1beta1 --kubelet-https=true --token-auth-file=/etc/kubernetes/token.csv --service-node-port-range=30000-32767 --tls-cert-file=/etc/kubernetes/ssl/kubernetes.pem --tls-private-key-file=/etc/kubernetes/ssl/kubernetes-key.pem --client-ca-file=/etc/kubernetes/ssl/ca.pem --service-account-key-file=/etc/kubernetes/ssl/ca-key.pem --etcd-cafile=/etc/kubernetes/ssl/ca.pem --etcd-certfile=/etc/kubernetes/ssl/kubernetes.pem --etcd-keyfile=/etc/kubernetes/ssl/kubernetes-key.pem --enable-swagger-ui=true --apiserver-count=3 --audit-log-maxage=30 --audit-log-maxbackup=3 --audit-log-maxsize=100 --audit-log-path=/var/lib/audit.log --event-ttl=1h"
+```
+
+ systemctl daemon-reload
+ 
