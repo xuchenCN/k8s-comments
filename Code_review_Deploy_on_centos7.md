@@ -514,3 +514,164 @@ KUBE_API_ARGS="--authorization-mode=RBAC --runtime-config=rbac.authorization.k8s
 
  systemctl daemon-reload
  
+/usr/lib/systemd/system/kube-controller-manager.service
+
+```
+[Unit]
+Description=Kubernetes Controller Manager
+Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+[Service]
+EnvironmentFile=-/etc/kubernetes/config
+EnvironmentFile=-/etc/kubernetes/controller-manager
+ExecStart=/root/k8s/cmd/kube-controller-manager \
+           $KUBE_LOGTOSTDERR \
+           $KUBE_LOG_LEVEL \
+           $KUBE_MASTER \
+           $KUBE_CONTROLLER_MANAGER_ARGS
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+```
+
+vim /etc/kubernetes/controller-manager
+
+```
+KUBE_CONTROLLER_MANAGER_ARGS="--address=127.0.0.1 --service-cluster-ip-range=10.254.0.0/16 --cluster-name=kubernetes --cluster-signing-cert-file=/etc/kubernetes/ssl/ca.pem --cluster-signing-key-file=/etc/kubernetes/ssl/ca-key.pem  --service-account-private-key-file=/etc/kubernetes/ssl/ca-key.pem --root-ca-file=/etc/kubernetes/ssl/ca.pem --leader-elect=true"
+```
+
+vim /etc/systemd/system/kube-scheduler.service
+
+```
+[Unit]
+   Description=Kubernetes Scheduler Plugin
+   Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+[Service]
+   EnvironmentFile=-/etc/kubernetes/config
+   EnvironmentFile=-/etc/kubernetes/scheduler
+   ExecStart=/root/k8s/cmd/kube-scheduler \
+               $KUBE_LOGTOSTDERR \
+               $KUBE_LOG_LEVEL \
+               $KUBE_MASTER \
+               $KUBE_SCHEDULER_ARGS
+   Restart=on-failure
+   LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+```
+
+vim /etc/kubernetes/scheduler
+
+```
+KUBE_SCHEDULER_ARGS="--leader-elect=true --address=127.0.0.1"
+```
+
+Config Node
+
+```
+$ kubectl config set-cluster kubernetes \
+  --certificate-authority=/etc/kubernetes/ssl/ca.pem \
+  --embed-certs=true \
+  --server="https://<master_ip>:6443" \
+  --kubeconfig=bootstrap.kubeconfig
+
+$ kubectl config set-credentials kubelet-bootstrap \
+     --token=81f7y4ba8b7ca874fcff68bf5ct41a7c (your gen it above) \
+     --kubeconfig=bootstrap.kubeconfig
+
+$ kubectl config set-context default \
+     --cluster=kubernetes \
+     --user=kubelet-bootstrap \
+     --kubeconfig=bootstrap.kubeconfig
+
+$ kubectl config use-context default --kubeconfig=bootstrap.kubeconfig
+```
+
+vim /etc/systemd/system/kubelet.service
+
+```
+[Unit]
+   Description=Kubernetes Kubelet Server
+   After=docker.service
+   Requires=docker.service
+[Service]
+   WorkingDirectory=/var/lib/kubelet
+   EnvironmentFile=-/etc/kubernetes/config
+   EnvironmentFile=-/etc/kubernetes/kubelet
+   ExecStart=/root/k8s/cmd/kubelet \
+               $KUBE_LOGTOSTDERR \
+               $KUBE_LOG_LEVEL \
+               $KUBELET_API_SERVER \
+               $KUBELET_ADDRESS \
+               $KUBELET_PORT \
+               $KUBELET_HOSTNAME \
+               $KUBE_ALLOW_PRIV \
+               $KUBELET_POD_INFRA_CONTAINER \
+               $KUBELET_ARGS
+Restart=on-failure 
+[Install]
+WantedBy=multi-user.target
+```
+
+mkdir -p /var/lib/kubelet
+
+vim /etc/kubernetes/kubelet
+
+```
+KUBELET_ADDRESS="--address=<hostip>
+KUBELET_HOSTNAME="--hostname-override=<hostip>"
+KUBELET_POD_INFRA_CONTAINER="--pod-infra-container-image=registry.access.redhat.com/rhel7/pod-infrastructure:latest"
+KUBELET_ARGS="--cgroup-driver=systemd --config=/etc/kubernetes/manifests/kubelet.yml --cluster_dns=10.254.0.2 --kubeconfig=/etc/kubernetes/bootstrap.kubeconfig --cert-dir=/etc/kubernetes/ssl --cluster_domain=cluster.local. --hairpin-mode promiscuous-bridge --serialize-image-pulls=false"
+```
+
+Config kube-proxy
+
+```
+kubectl config set-cluster kubernetes \
+  --certificate-authority=/etc/kubernetes/ssl/ca.pem \
+  --embed-certs=true \
+  --server="https://10.110.158.162:6443" \
+  --kubeconfig=kube-proxy.kubeconfig
+
+kubectl config set-credentials kube-proxy \
+  --client-certificate=/etc/kubernetes/ssl/kube-proxy.pem \
+  --client-key=/etc/kubernetes/ssl/kube-proxy-key.pem \
+  --embed-certs=true \
+  --kubeconfig=kube-proxy.kubeconfig
+
+kubectl config set-context default \
+  --cluster=kubernetes \
+  --user=kube-proxy \
+  --kubeconfig=kube-proxy.kubeconfig
+
+kubectl config use-context default --kubeconfig=kube-proxy.kubeconfig
+```
+
+vim /etc/kubernetes/kube-proxy
+
+```
+KUBE_PROXY_ARGS="--bind-address=<hostip> --kubeconfig=/etc/kubernetes/kube-proxy.kubeconfig --cluster-cidr=10.254.0.0/16"
+```
+
+vim /usr/lib/systemd/system/kube-proxy.service
+
+```
+[Unit]
+Description=Kubernetes Kube-Proxy Server
+Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+After=network.target
+[Service]
+EnvironmentFile=-/etc/kubernetes/config
+EnvironmentFile=-/etc/kubernetes/kube-proxy
+ExecStart=/root/k8s/cmd/kube-proxy \
+           $KUBE_LOGTOSTDERR \
+           $KUBE_LOG_LEVEL \
+           $KUBE_MASTER \
+           $KUBE_PROXY_ARGS
+Restart=on-failure
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+```
+
+systemctl daemon-reload
