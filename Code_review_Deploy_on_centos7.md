@@ -1,6 +1,8 @@
 
 # Prepare Nodes
 
+Node1 10.110.158.162 (master,kubelet,etcd)
+Node1 10.110.158.165 (kubelet)
 
 Disable the SELinux using the below commands.
 
@@ -181,11 +183,11 @@ vim ca-csr.json
     "size": 2048
   },
   "names":[{
-    "C": "<country>",
-    "ST": "<state>",
-    "L": "<city>",
-    "O": "<organization>",
-    "OU": "<organization unit>"
+    "C": "CN",
+    "ST": "Peking",
+    "L": "Peking",
+    "O": "k8s",
+    "OU": "system"
   }]
 }
 ```
@@ -203,10 +205,8 @@ vim kubernetes-csr.json
   "CN": "kubernetes",
   "hosts": [
     "127.0.0.1",
-    "<MASTER_IP>",
-    "<NODE1_IP>",
-    "<NODE2_IP>",
-    "<MASTER_CLUSTER_IP>(10.254.0.1)",
+    "10.110.158.162",
+    "10.254.0.1",
     "kubernetes",
     "kubernetes.default",
     "kubernetes.default.svc",
@@ -218,11 +218,11 @@ vim kubernetes-csr.json
     "size": 2048
   },
   "names": [{
-    "C": "<country>",
-    "ST": "<state>",
-    "L": "<city>",
+    "C": "CN",
+    "ST": "Peking",
+    "L": "Peking",
     "O": "k8s",
-    "OU": "<organization unit>"
+    "OU": "system"
   }]
 }
 ```
@@ -231,17 +231,20 @@ vim admin-csr.json
 ```
 {
   "CN": "admin",
+  "hosts": [],
   "key": {
     "algo": "rsa",
     "size": 2048
   },
-  "names":[{
-    "C": "<country>",
-    "ST": "<state>",
-    "L": "<city>",
-    "O": "system:master",
-    "OU": "<organization unit>"
-  }]
+  "names": [
+    {
+      "C": "CN",
+      "ST": "Peking",
+      "L": "Peking",
+      "O": "system:masters",
+      "OU": "system"
+    }
+  ]
 }
 ```
 
@@ -253,7 +256,28 @@ vim kube-proxy-csr.json
 
 ```
 {
-     "CN": "system:kube-proxy",
+  "CN": "system:kube-proxy",
+  "hosts": [],
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+    {
+      "C": "CN",
+      "ST": "Peking",
+      "L": "Peking",
+      "O": "k8s",
+      "OU": "system"
+    }
+  ]
+}
+```
+vim metrics-server-csr.json
+
+```
+{
+     "CN": "system:metrics-server",
      "hosts": [],
      "key": {
        "algo": "rsa",
@@ -261,13 +285,17 @@ vim kube-proxy-csr.json
      },
 "names": [ {
          "C": "CN",
-         "ST": "HangZhoue",
-         "L": "HangZhoue",
+         "ST": "Peking",
+         "L": "Peking",
          "O": "k8s",
-         "OU": "System"
+         "OU": "system"
 } ]
+
 }
 ```
+
+
+
 On all nodes ``` mkdir -p /etc/kubernetes/ssl/```
 Dispatch all pem files acorrding the relations to ```/etc/kubernetes/ssl/```
 
@@ -279,6 +307,7 @@ kubelet： ca.pem；
 kube-proxy： ca.pem、kube-proxy-key.pem、kube-proxy.pem；
 kubectl： ca.pem、admin-key.pem、admin.pem；
 kube-controller-manager： ca-key.pem、ca.pem
+metrics-server: metrics-server.pem metrics-server-key.pem
 ```
 
 Install Etcd
@@ -509,7 +538,7 @@ KUBE_API_ADDRESS="--advertise-address=10.110.158.162 --bind-address=10.110.158.1
 KUBE_ETCD_SERVERS="--etcd-servers=https://10.110.158.162:2379"
 KUBE_SERVICE_ADDRESSES="--service-cluster-ip-range=10.254.0.0/16"
 KUBE_ADMISSION_CONTROL="--admission-control=ServiceAccount,NamespaceLifecycle,NamespaceExists,LimitRanger,ResourceQuota"
-KUBE_API_ARGS="--authorization-mode=RBAC --runtime-config=rbac.authorization.k8s.io/v1beta1 --kubelet-https=true --token-auth-file=/etc/kubernetes/token.csv --service-node-port-range=30000-32767 --tls-cert-file=/etc/kubernetes/ssl/kubernetes.pem --tls-private-key-file=/etc/kubernetes/ssl/kubernetes-key.pem --client-ca-file=/etc/kubernetes/ssl/ca.pem --service-account-key-file=/etc/kubernetes/ssl/ca-key.pem --etcd-cafile=/etc/kubernetes/ssl/ca.pem --etcd-certfile=/etc/kubernetes/ssl/kubernetes.pem --etcd-keyfile=/etc/kubernetes/ssl/kubernetes-key.pem --enable-swagger-ui=true --apiserver-count=3 --audit-log-maxage=30 --audit-log-maxbackup=3 --audit-log-maxsize=100 --audit-log-path=/var/lib/audit.log --event-ttl=1h"
+KUBE_API_ARGS="--authorization-mode=RBAC --runtime-config=rbac.authorization.k8s.io/v1beta1 --kubelet-https=true --token-auth-file=/etc/kubernetes/token.csv --service-node-port-range=30000-32767 --tls-cert-file=/etc/kubernetes/ssl/kubernetes.pem --tls-private-key-file=/etc/kubernetes/ssl/kubernetes-key.pem --client-ca-file=/etc/kubernetes/ssl/ca.pem --service-account-key-file=/etc/kubernetes/ssl/ca-key.pem --etcd-cafile=/etc/kubernetes/ssl/ca.pem --etcd-certfile=/etc/kubernetes/ssl/kubernetes.pem --etcd-keyfile=/etc/kubernetes/ssl/kubernetes-key.pem --enable-swagger-ui=true --apiserver-count=3 --audit-log-maxage=30 --audit-log-maxbackup=3 --audit-log-maxsize=100 --audit-log-path=/var/lib/audit.log --event-ttl=1h --requestheader-client-ca-file=/etc/kubernetes/ssl/ca.pem --requestheader-allowed-names=aggregator,metrics-server --requestheader-extra-headers-prefix=X-Remote-Extra- --requestheader-group-headers=X-Remote-Group --requestheader-username-headers=X-Remote-User --proxy-client-cert-file=/etc/kubernetes/ssl/metrics-server.pem --proxy-client-key-file=/etc/kubernetes/ssl/metrics-server-key.pem --kubelet-client-certificate=/etc/kubernetes/ssl/admin.pem --kubelet-client-key=/etc/kubernetes/ssl/admin-key.pem"
 ```
 
  systemctl daemon-reload
@@ -602,13 +631,12 @@ vim /etc/systemd/system/kubelet.service
                $KUBE_LOGTOSTDERR \
                $KUBE_LOG_LEVEL \
                $KUBELET_API_SERVER \
-               $KUBELET_ADDRESS \
                $KUBELET_PORT \
                $KUBELET_HOSTNAME \
                $KUBE_ALLOW_PRIV \
                $KUBELET_POD_INFRA_CONTAINER \
                $KUBELET_ARGS
-Restart=on-failure 
+Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 ```
@@ -618,11 +646,11 @@ mkdir -p /var/lib/kubelet
 vim /etc/kubernetes/kubelet
 
 ```
-KUBELET_ADDRESS="--address=<hostip>
-KUBELET_HOSTNAME="--hostname-override=<hostip>"
+KUBELET_HOSTNAME="--hostname-override=10.110.158.165"
 KUBELET_POD_INFRA_CONTAINER="--pod-infra-container-image=registry.access.redhat.com/rhel7/pod-infrastructure:latest"
-KUBELET_ARGS="--cgroup-driver=systemd --config=/etc/kubernetes/manifests/kubelet.yml --cluster_dns=10.254.0.2 --kubeconfig=/etc/kubernetes/bootstrap.kubeconfig --cert-dir=/etc/kubernetes/ssl --cluster_domain=cluster.local. --hairpin-mode promiscuous-bridge --serialize-image-pulls=false"
+KUBELET_ARGS="--config=/etc/kubernetes/manifests/kubelet.yml --kubeconfig=/etc/kubernetes/bootstrap.kubeconfig --cert-dir=/etc/kubernetes/ssl"
 ```
+NOTE : ```KUBELET_HOSTNAME="--hostname-override=10.110.158.162" to 162```
 
 Config kube-proxy
 
@@ -675,3 +703,43 @@ WantedBy=multi-user.target
 ```
 
 systemctl daemon-reload
+
+Deploy metrics-server
+
+git clone https://github.com/kubernetes-incubator/metrics-server.git
+cd metrics-server
+git tag
+v0.1.0
+v0.2.0
+v0.2.1
+v0.3.0
+v0.3.0-alpha.1
+v0.3.1
+
+Checkout last tag
+```
+git checkout v0.3.1
+```
+
+```
+kubectl create -f ./deploy/1.8+/
+```
+
+```
+kubectl get pods -n=kube-system
+```
+
+```
+NAME                              READY   STATUS    RESTARTS   AGE
+metrics-server-6cbd98fc8d-cvtcs   1/1     Running   0          31m
+```
+
+```
+kubectl top nodes
+```
+
+```
+NAME             CPU(cores)   CPU%   MEMORY(bytes)   MEMORY%
+10.110.158.162   235m         0%     10081Mi         7%
+10.110.158.165   64m          0%     962Mi           0%
+```
