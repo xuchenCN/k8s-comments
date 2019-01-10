@@ -294,6 +294,9 @@ vim metrics-server-csr.json
 }
 ```
 
+```
+cfssl gencert -ca=/etc/kubernetes/ssl/ca.pem -ca-key=/etc/kubernetes/ssl/ca-key.pem -config=ca-config.json -profile=kubernetes metrics-server-csr.json | cfssljson -bare metrics-server
+```
 
 
 On all nodes ``` mkdir -p /etc/kubernetes/ssl/```
@@ -707,6 +710,8 @@ systemctl daemon-reload
 Deploy metrics-server
 
 git clone https://github.com/kubernetes-incubator/metrics-server.git
+
+```
 cd metrics-server
 git tag
 v0.1.0
@@ -715,10 +720,27 @@ v0.2.1
 v0.3.0
 v0.3.0-alpha.1
 v0.3.1
+```
 
 Checkout last tag
 ```
 git checkout v0.3.1
+```
+
+Modify metrics-server-deployment.yaml
+
+```
+spec:
+    .......
+      containers:
+      - name: metrics-server
+        command: ["/metrics-server"]
+        args: ["--requestheader-client-ca-file=/etc/kubernetes/ssl/ca.pem","--client-ca-file=/etc/kubernetes/ssl/ca.pem","--tls-cert-file=/etc/kubernetes/ssl/metrics-server.pem","--tls-private-key-file=/etc/kubernetes/ssl/metrics-server-key.pem","--kubelet-insecure-tls"]
+        #args: ["--requestheader-client-ca-file=/etc/kubernetes/ssl/ca.pem","--kubelet-insecure-tls"]
+        # For the sake of GFW
+        image: mirrorgooglecontainers/metrics-server-amd64:v0.3.1
+        imagePullPolicy: Always
+     ........
 ```
 
 ```
@@ -728,6 +750,7 @@ kubectl create -f ./deploy/1.8+/
 ```
 kubectl get pods -n=kube-system
 ```
+
 
 ```
 NAME                              READY   STATUS    RESTARTS   AGE
