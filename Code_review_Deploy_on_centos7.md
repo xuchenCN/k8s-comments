@@ -88,6 +88,7 @@ Config Docker ```/etc/docker/daemon.json```
   "insecure-registries":["xxx","xxx"],
   "registry-mirrors": ["xxx"],
   "data-root" : "/home/docker",
+  "default-runtime": "nvidia",
   "experimental": true,
   "live-restore": true,
   "exec-opts": ["native.cgroupdriver=systemd"],
