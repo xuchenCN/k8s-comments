@@ -1299,3 +1299,9 @@ spec:
           hostPath:
             path: /var/lib/kubelet/device-plugins
 ```
+
+Minikube for aliyun
+
+```
+https://yq.aliyun.com/articles/221687?spm=a2c4e.11153940.blogcont508460.18.3ede63a3nSaMxE
+```
