@@ -28,7 +28,8 @@
 
 ### Services, Load Balancing, and Networking
 #### Services
-暴露服务给Cluster内部使用
+暴露服务给Cluster内部使用;
+Headless service : 将ClusterIP 设置为None 让DNS能够解析到pod一层
 #### Ingress
 暴露Service给Cluster外部使用，目前只有单点（如果不在云上），有些方案例如VIP等来解决单点
 不同的Controller对应不同的方案
