@@ -47,15 +47,15 @@ package azure
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"unicode"
-
-	jwt "github.com/dgrijalva/jwt-go"
 )
 
 type authDirective struct {
@@ -63,22 +63,11 @@ type authDirective struct {
 	realm   string
 }
 
-type accessTokenPayload struct {
-	TenantID string `json:"tid"`
-}
-
-type acrTokenPayload struct {
-	Expiration int64  `json:"exp"`
-	TenantID   string `json:"tenant"`
-	Credential string `json:"credential"`
-}
-
 type acrAuthResponse struct {
 	RefreshToken string `json:"refresh_token"`
 }
 
 // 5 minutes buffer time to allow timeshift between local machine and AAD
-const timeShiftBuffer = 300
 const userAgentHeader = "User-Agent"
 const userAgent = "kubernetes-credentialprovider-acr"
 
@@ -94,7 +83,10 @@ func receiveChallengeFromLoginServer(serverAddress string) (*authDirective, erro
 	}
 	var err error
 	var r *http.Request
-	r, _ = http.NewRequest("GET", challengeURL.String(), nil)
+	r, err = http.NewRequest("GET", challengeURL.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to construct request, got %v", err)
+	}
 	r.Header.Add(userAgentHeader, userAgent)
 
 	var challenge *http.Response
@@ -142,23 +134,6 @@ func receiveChallengeFromLoginServer(serverAddress string) (*authDirective, erro
 	}, nil
 }
 
-func parseAcrToken(identityToken string) (token *acrTokenPayload, err error) {
-	tokenSegments := strings.Split(identityToken, ".")
-	if len(tokenSegments) < 2 {
-		return nil, fmt.Errorf("Invalid existing refresh token length: %d", len(tokenSegments))
-	}
-	payloadSegmentEncoded := tokenSegments[1]
-	var payloadBytes []byte
-	if payloadBytes, err = jwt.DecodeSegment(payloadSegmentEncoded); err != nil {
-		return nil, fmt.Errorf("Error decoding payload segment from refresh token, error: %s", err)
-	}
-	var payload acrTokenPayload
-	if err = json.Unmarshal(payloadBytes, &payload); err != nil {
-		return nil, fmt.Errorf("Error unmarshalling acr payload, error: %s", err)
-	}
-	return &payload, nil
-}
-
 func performTokenExchange(
 	serverAddress string,
 	directive *authDirective,
@@ -181,7 +156,10 @@ func performTokenExchange(
 
 	datac := data.Encode()
 	var r *http.Request
-	r, _ = http.NewRequest("POST", authEndpoint, bytes.NewBufferString(datac))
+	r, err = http.NewRequest("POST", authEndpoint, bytes.NewBufferString(datac))
+	if err != nil {
+		return "", fmt.Errorf("failed to construct request, got %v", err)
+	}
 	r.Header.Add(userAgentHeader, userAgent)
 	r.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	r.Header.Add("Content-Length", strconv.Itoa(len(datac)))
@@ -197,8 +175,13 @@ func performTokenExchange(
 	}
 
 	var content []byte
-	if content, err = ioutil.ReadAll(exchange.Body); err != nil {
+	limitedReader := &io.LimitedReader{R: exchange.Body, N: maxReadLength}
+	if content, err = ioutil.ReadAll(limitedReader); err != nil {
 		return "", fmt.Errorf("Www-Authenticate: error reading response from %s", authEndpoint)
+	}
+
+	if limitedReader.N <= 0 {
+		return "", errors.New("the read limit is reached")
 	}
 
 	var authResp acrAuthResponse

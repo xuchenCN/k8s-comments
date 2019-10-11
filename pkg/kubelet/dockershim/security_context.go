@@ -24,7 +24,7 @@ import (
 	"github.com/blang/semver"
 	dockercontainer "github.com/docker/docker/api/types/container"
 
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	knetwork "k8s.io/kubernetes/pkg/kubelet/dockershim/network"
 )
 
@@ -90,7 +90,7 @@ func modifyContainerConfig(sc *runtimeapi.LinuxContainerSecurityContext, config 
 	user := config.User
 	if sc.RunAsGroup != nil {
 		if user == "" {
-			return fmt.Errorf("runAsGroup is specified without a runAsUser.")
+			return fmt.Errorf("runAsGroup is specified without a runAsUser")
 		}
 		user = fmt.Sprintf("%s:%d", config.User, sc.GetRunAsGroup().Value)
 	}
@@ -135,6 +135,11 @@ func modifyHostConfig(sc *runtimeapi.LinuxContainerSecurityContext, hostConfig *
 
 	if sc.NoNewPrivs {
 		hostConfig.SecurityOpt = append(hostConfig.SecurityOpt, "no-new-privileges")
+	}
+
+	if !hostConfig.Privileged {
+		hostConfig.MaskedPaths = sc.MaskedPaths
+		hostConfig.ReadonlyPaths = sc.ReadonlyPaths
 	}
 
 	return nil

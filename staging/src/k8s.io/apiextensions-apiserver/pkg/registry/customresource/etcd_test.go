@@ -17,7 +17,6 @@ limitations under the License.
 package customresource_test
 
 import (
-	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -37,7 +36,7 @@ import (
 	"k8s.io/apiserver/pkg/registry/generic"
 	registrytest "k8s.io/apiserver/pkg/registry/generic/testing"
 	"k8s.io/apiserver/pkg/registry/rest"
-	etcdtesting "k8s.io/apiserver/pkg/storage/etcd/testing"
+	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
 
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver"
@@ -46,9 +45,9 @@ import (
 	"k8s.io/apiextensions-apiserver/pkg/registry/customresource/tableconvertor"
 )
 
-func newStorage(t *testing.T) (customresource.CustomResourceStorage, *etcdtesting.EtcdTestServer) {
-	server, etcdStorage := etcdtesting.NewUnsecuredEtcd3TestClientServer(t)
-	etcdStorage.Codec = unstructuredJsonCodec{}
+func newStorage(t *testing.T) (customresource.CustomResourceStorage, *etcd3testing.EtcdTestServer) {
+	server, etcdStorage := etcd3testing.NewUnsecuredEtcd3TestClientServer(t)
+	etcdStorage.Codec = unstructured.UnstructuredJSONScheme
 	restOptions := generic.RESTOptions{StorageConfig: etcdStorage, Decorator: generic.UndecoratedStorage, DeleteCollectionWorkers: 1, ResourcePrefix: "noxus"}
 
 	parameterScheme := runtime.NewScheme()
@@ -91,11 +90,13 @@ func newStorage(t *testing.T) (customresource.CustomResourceStorage, *etcdtestin
 
 	storage := customresource.NewStorage(
 		schema.GroupResource{Group: "mygroup.example.com", Resource: "noxus"},
+		kind,
 		schema.GroupVersionKind{Group: "mygroup.example.com", Version: "v1beta1", Kind: "NoxuItemList"},
 		customresource.NewStrategy(
 			typer,
 			true,
 			kind,
+			nil,
 			nil,
 			nil,
 			status,
@@ -254,7 +255,7 @@ func TestColumns(t *testing.T) {
 	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), metav1.NamespaceDefault)
 	key := "/noxus/" + metav1.NamespaceDefault + "/foo"
 	validCustomResource := validNewCustomResource()
-	if err := storage.CustomResource.Storage.Create(ctx, key, validCustomResource, nil, 0); err != nil {
+	if err := storage.CustomResource.Storage.Create(ctx, key, validCustomResource, nil, 0, false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -324,7 +325,7 @@ func TestStatusUpdate(t *testing.T) {
 	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), metav1.NamespaceDefault)
 	key := "/noxus/" + metav1.NamespaceDefault + "/foo"
 	validCustomResource := validNewCustomResource()
-	if err := storage.CustomResource.Storage.Create(ctx, key, validCustomResource, nil, 0); err != nil {
+	if err := storage.CustomResource.Storage.Create(ctx, key, validCustomResource, nil, 0, false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -375,11 +376,15 @@ func TestScaleGet(t *testing.T) {
 	var cr unstructured.Unstructured
 	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), metav1.NamespaceDefault)
 	key := "/noxus/" + metav1.NamespaceDefault + "/" + name
-	if err := storage.CustomResource.Storage.Create(ctx, key, &validCustomResource, &cr, 0); err != nil {
+	if err := storage.CustomResource.Storage.Create(ctx, key, &validCustomResource, &cr, 0, false); err != nil {
 		t.Fatalf("error setting new custom resource (key: %s) %v: %v", key, validCustomResource, err)
 	}
 
 	want := &autoscalingv1.Scale{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Scale",
+			APIVersion: "autoscaling/v1",
+		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              cr.GetName(),
 			Namespace:         metav1.NamespaceDefault,
@@ -415,7 +420,7 @@ func TestScaleGetWithoutSpecReplicas(t *testing.T) {
 	key := "/noxus/" + metav1.NamespaceDefault + "/" + name
 	withoutSpecReplicas := validCustomResource.DeepCopy()
 	unstructured.RemoveNestedField(withoutSpecReplicas.Object, "spec", "replicas")
-	if err := storage.CustomResource.Storage.Create(ctx, key, withoutSpecReplicas, &cr, 0); err != nil {
+	if err := storage.CustomResource.Storage.Create(ctx, key, withoutSpecReplicas, &cr, 0, false); err != nil {
 		t.Fatalf("error setting new custom resource (key: %s) %v: %v", key, withoutSpecReplicas, err)
 	}
 
@@ -438,7 +443,7 @@ func TestScaleUpdate(t *testing.T) {
 	var cr unstructured.Unstructured
 	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), metav1.NamespaceDefault)
 	key := "/noxus/" + metav1.NamespaceDefault + "/" + name
-	if err := storage.CustomResource.Storage.Create(ctx, key, &validCustomResource, &cr, 0); err != nil {
+	if err := storage.CustomResource.Storage.Create(ctx, key, &validCustomResource, &cr, 0, false); err != nil {
 		t.Fatalf("error setting new custom resource (key: %s) %v: %v", key, validCustomResource, err)
 	}
 
@@ -492,7 +497,7 @@ func TestScaleUpdateWithoutSpecReplicas(t *testing.T) {
 	key := "/noxus/" + metav1.NamespaceDefault + "/" + name
 	withoutSpecReplicas := validCustomResource.DeepCopy()
 	unstructured.RemoveNestedField(withoutSpecReplicas.Object, "spec", "replicas")
-	if err := storage.CustomResource.Storage.Create(ctx, key, withoutSpecReplicas, &cr, 0); err != nil {
+	if err := storage.CustomResource.Storage.Create(ctx, key, withoutSpecReplicas, &cr, 0, false); err != nil {
 		t.Fatalf("error setting new custom resource (key: %s) %v: %v", key, withoutSpecReplicas, err)
 	}
 
@@ -519,28 +524,6 @@ func TestScaleUpdateWithoutSpecReplicas(t *testing.T) {
 	if scale.Spec.Replicas != int32(replicas) {
 		t.Errorf("wrong replicas count: expected: %d got: %d", replicas, scale.Spec.Replicas)
 	}
-}
-
-type unstructuredJsonCodec struct{}
-
-func (c unstructuredJsonCodec) Decode(data []byte, defaults *schema.GroupVersionKind, into runtime.Object) (runtime.Object, *schema.GroupVersionKind, error) {
-	obj := into.(*unstructured.Unstructured)
-	err := obj.UnmarshalJSON(data)
-	if err != nil {
-		return nil, nil, err
-	}
-	gvk := obj.GroupVersionKind()
-	return obj, &gvk, nil
-}
-
-func (c unstructuredJsonCodec) Encode(obj runtime.Object, w io.Writer) error {
-	u := obj.(*unstructured.Unstructured)
-	bs, err := u.MarshalJSON()
-	if err != nil {
-		return err
-	}
-	w.Write(bs)
-	return nil
 }
 
 func setSpecReplicas(u *unstructured.Unstructured, replicas int64) {

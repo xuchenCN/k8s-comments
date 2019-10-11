@@ -17,6 +17,7 @@ limitations under the License.
 package storage
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"reflect"
@@ -36,16 +37,20 @@ import (
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/registry/rest"
-	etcdtesting "k8s.io/apiserver/pkg/storage/etcd/testing"
+	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
+	"k8s.io/apiserver/pkg/util/dryrun"
 
 	"k8s.io/kubernetes/pkg/api/service"
 	api "k8s.io/kubernetes/pkg/apis/core"
-	"k8s.io/kubernetes/pkg/apis/core/helper"
 	endpointstore "k8s.io/kubernetes/pkg/registry/core/endpoint/storage"
 	podstore "k8s.io/kubernetes/pkg/registry/core/pod/storage"
 	"k8s.io/kubernetes/pkg/registry/core/service/ipallocator"
 	"k8s.io/kubernetes/pkg/registry/core/service/portallocator"
 	"k8s.io/kubernetes/pkg/registry/registrytest"
+
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 // TODO(wojtek-t): Cleanup this file.
@@ -108,6 +113,9 @@ func (s *serviceStorage) New() runtime.Object {
 }
 
 func (s *serviceStorage) Create(ctx context.Context, obj runtime.Object, createValidation rest.ValidateObjectFunc, options *metav1.CreateOptions) (runtime.Object, error) {
+	if dryrun.IsDryRun(options.DryRun) {
+		return obj, s.Err
+	}
 	svc := obj.(*api.Service)
 	s.CreatedID = obj.(metav1.Object).GetName()
 	s.Service = svc.DeepCopy()
@@ -121,21 +129,25 @@ func (s *serviceStorage) Create(ctx context.Context, obj runtime.Object, createV
 }
 
 func (s *serviceStorage) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
-	s.UpdatedID = name
 	obj, err := objInfo.UpdatedObject(ctx, s.OldService)
 	if err != nil {
 		return nil, false, err
 	}
-	s.Service = obj.(*api.Service)
-	return s.Service, s.Created, s.Err
+	if !dryrun.IsDryRun(options.DryRun) {
+		s.UpdatedID = name
+		s.Service = obj.(*api.Service)
+	}
+	return obj, s.Created, s.Err
 }
 
-func (s *serviceStorage) Delete(ctx context.Context, name string, options *metav1.DeleteOptions) (runtime.Object, bool, error) {
-	s.DeletedID = name
+func (s *serviceStorage) Delete(ctx context.Context, name string, deleteValidation rest.ValidateObjectFunc, options *metav1.DeleteOptions) (runtime.Object, bool, error) {
+	if !dryrun.IsDryRun(options.DryRun) {
+		s.DeletedID = name
+	}
 	return s.Service, s.DeletedImmediately, s.Err
 }
 
-func (s *serviceStorage) DeleteCollection(ctx context.Context, options *metav1.DeleteOptions, listOptions *metainternalversion.ListOptions) (runtime.Object, error) {
+func (s *serviceStorage) DeleteCollection(ctx context.Context, deleteValidation rest.ValidateObjectFunc, options *metav1.DeleteOptions, listOptions *metainternalversion.ListOptions) (runtime.Object, error) {
 	panic("not implemented")
 }
 
@@ -151,55 +163,78 @@ func (s *serviceStorage) Export(ctx context.Context, name string, opts metav1.Ex
 	panic("not implemented")
 }
 
+func (s *serviceStorage) StorageVersion() runtime.GroupVersioner {
+	panic("not implemented")
+}
+
 func generateRandomNodePort() int32 {
 	return int32(rand.IntnRange(30001, 30999))
 }
 
-func NewTestREST(t *testing.T, endpoints *api.EndpointsList) (*REST, *serviceStorage, *etcdtesting.EtcdTestServer) {
-	return NewTestRESTWithPods(t, endpoints, nil)
+func NewTestREST(t *testing.T, endpoints *api.EndpointsList, dualStack bool) (*REST, *serviceStorage, *etcd3testing.EtcdTestServer) {
+	return NewTestRESTWithPods(t, endpoints, nil, dualStack)
 }
 
-func NewTestRESTWithPods(t *testing.T, endpoints *api.EndpointsList, pods *api.PodList) (*REST, *serviceStorage, *etcdtesting.EtcdTestServer) {
+func NewTestRESTWithPods(t *testing.T, endpoints *api.EndpointsList, pods *api.PodList, dualStack bool) (*REST, *serviceStorage, *etcd3testing.EtcdTestServer) {
 	etcdStorage, server := registrytest.NewEtcdStorage(t, "")
 
 	serviceStorage := &serviceStorage{}
 
-	podStorage := podstore.NewStorage(generic.RESTOptions{
+	podStorage, err := podstore.NewStorage(generic.RESTOptions{
 		StorageConfig:           etcdStorage,
 		Decorator:               generic.UndecoratedStorage,
 		DeleteCollectionWorkers: 3,
 		ResourcePrefix:          "pods",
 	}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error from REST storage: %v", err)
+	}
 	if pods != nil && len(pods.Items) > 0 {
 		ctx := genericapirequest.NewDefaultContext()
 		for ix := range pods.Items {
 			key, _ := podStorage.Pod.KeyFunc(ctx, pods.Items[ix].Name)
-			if err := podStorage.Pod.Storage.Create(ctx, key, &pods.Items[ix], nil, 0); err != nil {
+			if err := podStorage.Pod.Storage.Create(ctx, key, &pods.Items[ix], nil, 0, false); err != nil {
 				t.Fatalf("Couldn't create pod: %v", err)
 			}
 		}
 	}
-	endpointStorage := endpointstore.NewREST(generic.RESTOptions{
+	endpointStorage, err := endpointstore.NewREST(generic.RESTOptions{
 		StorageConfig:  etcdStorage,
 		Decorator:      generic.UndecoratedStorage,
 		ResourcePrefix: "endpoints",
 	})
+	if err != nil {
+		t.Fatalf("unexpected error from REST storage: %v", err)
+	}
 	if endpoints != nil && len(endpoints.Items) > 0 {
 		ctx := genericapirequest.NewDefaultContext()
 		for ix := range endpoints.Items {
 			key, _ := endpointStorage.KeyFunc(ctx, endpoints.Items[ix].Name)
-			if err := endpointStorage.Store.Storage.Create(ctx, key, &endpoints.Items[ix], nil, 0); err != nil {
+			if err := endpointStorage.Store.Storage.Create(ctx, key, &endpoints.Items[ix], nil, 0, false); err != nil {
 				t.Fatalf("Couldn't create endpoint: %v", err)
 			}
 		}
 	}
 
-	r := ipallocator.NewCIDRRange(makeIPNet(t))
+	r, err := ipallocator.NewCIDRRange(makeIPNet(t))
+	if err != nil {
+		t.Fatalf("cannot create CIDR Range %v", err)
+	}
+	var rSecondary ipallocator.Interface
+	if dualStack {
+		rSecondary, err = ipallocator.NewCIDRRange(makeIPNet6(t))
+		if err != nil {
+			t.Fatalf("cannot create CIDR Range(secondary) %v", err)
+		}
+	}
 
 	portRange := utilnet.PortRange{Base: 30000, Size: 1000}
-	portAllocator := portallocator.NewPortAllocator(portRange)
+	portAllocator, err := portallocator.NewPortAllocator(portRange)
+	if err != nil {
+		t.Fatalf("cannot create port allocator %v", err)
+	}
 
-	rest, _ := NewREST(serviceStorage, endpointStorage, podStorage.Pod, r, portAllocator, nil)
+	rest, _ := NewREST(serviceStorage, endpointStorage, podStorage.Pod, r, rSecondary, portAllocator, nil)
 
 	return rest, serviceStorage, server
 }
@@ -210,6 +245,27 @@ func makeIPNet(t *testing.T) *net.IPNet {
 		t.Error(err)
 	}
 	return net
+}
+func makeIPNet6(t *testing.T) *net.IPNet {
+	_, net, err := net.ParseCIDR("2000::/108")
+	if err != nil {
+		t.Error(err)
+	}
+	return net
+}
+
+func ipnetGet(t *testing.T, secondary bool) *net.IPNet {
+	if secondary {
+		return makeIPNet6(t)
+	}
+	return makeIPNet(t)
+}
+
+func allocGet(r *REST, secondary bool) ipallocator.Interface {
+	if secondary {
+		return r.secondaryServiceIPs
+	}
+	return r.serviceIPs
 }
 
 func releaseServiceNodePorts(t *testing.T, ctx context.Context, svcName string, rest *REST, registry ServiceStorage) {
@@ -232,16 +288,221 @@ func releaseServiceNodePorts(t *testing.T, ctx context.Context, svcName string, 
 }
 
 func TestServiceRegistryCreate(t *testing.T) {
-	storage, registry, server := NewTestREST(t, nil)
+	ipv4Service := api.IPv4Protocol
+	ipv6Service := api.IPv6Protocol
+
+	testCases := []struct {
+		svc             *api.Service
+		name            string
+		enableDualStack bool
+		useSecondary    bool
+	}{
+		{
+			name:            "Service IPFamily default cluster dualstack:off",
+			enableDualStack: false,
+			useSecondary:    false,
+			svc: &api.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+				Spec: api.ServiceSpec{
+					Selector:        map[string]string{"bar": "baz"},
+					SessionAffinity: api.ServiceAffinityNone,
+					Type:            api.ServiceTypeClusterIP,
+					Ports: []api.ServicePort{{
+						Port:       6502,
+						Protocol:   api.ProtocolTCP,
+						TargetPort: intstr.FromInt(6502),
+					}},
+				},
+			},
+		},
+		{
+			name:            "Service IPFamily:v4 dualstack off",
+			enableDualStack: false,
+			useSecondary:    false,
+			svc: &api.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+				Spec: api.ServiceSpec{
+					Selector:        map[string]string{"bar": "baz"},
+					SessionAffinity: api.ServiceAffinityNone,
+					Type:            api.ServiceTypeClusterIP,
+					IPFamily:        &ipv4Service,
+					Ports: []api.ServicePort{{
+						Port:       6502,
+						Protocol:   api.ProtocolTCP,
+						TargetPort: intstr.FromInt(6502),
+					}},
+				},
+			},
+		},
+		{
+			name:            "Service IPFamily:v4 dualstack on",
+			enableDualStack: true,
+			useSecondary:    false,
+			svc: &api.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+				Spec: api.ServiceSpec{
+					Selector:        map[string]string{"bar": "baz"},
+					SessionAffinity: api.ServiceAffinityNone,
+					Type:            api.ServiceTypeClusterIP,
+					IPFamily:        &ipv4Service,
+					Ports: []api.ServicePort{{
+						Port:       6502,
+						Protocol:   api.ProtocolTCP,
+						TargetPort: intstr.FromInt(6502),
+					}},
+				},
+			},
+		},
+		{
+			name:            "Service IPFamily:v6 dualstack on",
+			enableDualStack: true,
+			useSecondary:    true,
+			svc: &api.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+				Spec: api.ServiceSpec{
+					Selector:        map[string]string{"bar": "baz"},
+					SessionAffinity: api.ServiceAffinityNone,
+					Type:            api.ServiceTypeClusterIP,
+					IPFamily:        &ipv6Service,
+					Ports: []api.ServicePort{{
+						Port:       6502,
+						Protocol:   api.ProtocolTCP,
+						TargetPort: intstr.FromInt(6502),
+					}},
+				},
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.IPv6DualStack, tc.enableDualStack)()
+			storage, registry, server := NewTestREST(t, nil, tc.enableDualStack)
+			defer server.Terminate(t)
+
+			ctx := genericapirequest.NewDefaultContext()
+			created_svc, err := storage.Create(ctx, tc.svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			created_service := created_svc.(*api.Service)
+			objMeta, err := meta.Accessor(created_service)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !metav1.HasObjectMetaSystemFieldValues(objMeta) {
+				t.Errorf("storage did not populate object meta field values")
+			}
+			if created_service.Name != "foo" {
+				t.Errorf("Expected foo, but got %v", created_service.Name)
+			}
+			if created_service.CreationTimestamp.IsZero() {
+				t.Errorf("Expected timestamp to be set, got: %v", created_service.CreationTimestamp)
+			}
+			allocNet := ipnetGet(t, tc.useSecondary)
+
+			if !allocNet.Contains(net.ParseIP(created_service.Spec.ClusterIP)) {
+				t.Errorf("Unexpected ClusterIP: %s", created_service.Spec.ClusterIP)
+			}
+			srv, err := registry.GetService(ctx, tc.svc.Name, &metav1.GetOptions{})
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if srv == nil {
+				t.Errorf("Failed to find service: %s", tc.svc.Name)
+			}
+		})
+	}
+}
+
+func TestServiceRegistryCreateDryRun(t *testing.T) {
+	ipv6Service := api.IPv6Protocol
+	testCases := []struct {
+		name            string
+		svc             *api.Service
+		enableDualStack bool
+		useSecondary    bool
+	}{
+		{
+			name:            "v4 service",
+			enableDualStack: false,
+			useSecondary:    false,
+			svc: &api.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+				Spec: api.ServiceSpec{
+					Selector:        map[string]string{"bar": "baz"},
+					SessionAffinity: api.ServiceAffinityNone,
+					Type:            api.ServiceTypeClusterIP,
+					ClusterIP:       "1.2.3.4",
+					Ports: []api.ServicePort{{
+						Port:       6502,
+						Protocol:   api.ProtocolTCP,
+						TargetPort: intstr.FromInt(6502),
+					}},
+				},
+			},
+		},
+		{
+			name:            "v6 service",
+			enableDualStack: true,
+			useSecondary:    true,
+			svc: &api.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+				Spec: api.ServiceSpec{
+					Selector:        map[string]string{"bar": "baz"},
+					SessionAffinity: api.ServiceAffinityNone,
+					Type:            api.ServiceTypeClusterIP,
+					IPFamily:        &ipv6Service,
+					ClusterIP:       "2000:0:0:0:0:0:0:1",
+					Ports: []api.ServicePort{{
+						Port:       6502,
+						Protocol:   api.ProtocolTCP,
+						TargetPort: intstr.FromInt(6502),
+					}},
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.IPv6DualStack, tc.enableDualStack)()
+			storage, registry, server := NewTestREST(t, nil, tc.enableDualStack)
+			defer server.Terminate(t)
+
+			ctx := genericapirequest.NewDefaultContext()
+			_, err := storage.Create(ctx, tc.svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			alloc := allocGet(storage, tc.useSecondary)
+
+			if alloc.Has(net.ParseIP(tc.svc.Spec.ClusterIP)) {
+				t.Errorf("unexpected side effect: ip allocated")
+			}
+			srv, err := registry.GetService(ctx, tc.svc.Name, &metav1.GetOptions{})
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if srv != nil {
+				t.Errorf("unexpected service found: %v", srv)
+			}
+		})
+	}
+}
+
+func TestDryRunNodePort(t *testing.T) {
+	storage, registry, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 
+	// Test dry run create request with a node port
 	svc := &api.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo"},
 		Spec: api.ServiceSpec{
 			Selector:        map[string]string{"bar": "baz"},
 			SessionAffinity: api.ServiceAffinityNone,
-			Type:            api.ServiceTypeClusterIP,
+			Type:            api.ServiceTypeNodePort,
 			Ports: []api.ServicePort{{
+				NodePort:   30010,
 				Port:       6502,
 				Protocol:   api.ProtocolTCP,
 				TargetPort: intstr.FromInt(6502),
@@ -249,38 +510,108 @@ func TestServiceRegistryCreate(t *testing.T) {
 		},
 	}
 	ctx := genericapirequest.NewDefaultContext()
-	created_svc, err := storage.Create(ctx, svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+
+	_, err := storage.Create(ctx, svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	created_service := created_svc.(*api.Service)
-	objMeta, err := meta.Accessor(created_service)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !metav1.HasObjectMetaSystemFieldValues(objMeta) {
-		t.Errorf("storage did not populate object meta field values")
-	}
-	if created_service.Name != "foo" {
-		t.Errorf("Expected foo, but got %v", created_service.Name)
-	}
-	if created_service.CreationTimestamp.IsZero() {
-		t.Errorf("Expected timestamp to be set, got: %v", created_service.CreationTimestamp)
-	}
-	if !makeIPNet(t).Contains(net.ParseIP(created_service.Spec.ClusterIP)) {
-		t.Errorf("Unexpected ClusterIP: %s", created_service.Spec.ClusterIP)
+	if storage.serviceNodePorts.Has(30010) {
+		t.Errorf("unexpected side effect: NodePort allocated")
 	}
 	srv, err := registry.GetService(ctx, svc.Name, &metav1.GetOptions{})
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	if srv == nil {
-		t.Errorf("Failed to find service: %s", svc.Name)
+	if srv != nil {
+		t.Errorf("unexpected service found: %v", srv)
+	}
+
+	// Test dry run create request with multi node port
+	svc = &api.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+		Spec: api.ServiceSpec{
+			Selector:        map[string]string{"bar": "baz"},
+			SessionAffinity: api.ServiceAffinityNone,
+			Type:            api.ServiceTypeNodePort,
+			Ports: []api.ServicePort{
+				{
+					Name:       "port-tcp",
+					Port:       53,
+					NodePort:   30053,
+					TargetPort: intstr.FromInt(6503),
+					Protocol:   api.ProtocolTCP,
+				},
+				{
+					Name:       "port-udp",
+					Port:       53,
+					NodePort:   30053,
+					TargetPort: intstr.FromInt(6503),
+					Protocol:   api.ProtocolUDP,
+				},
+			},
+		},
+	}
+	expectNodePorts := collectServiceNodePorts(svc)
+	created_svc, err := storage.Create(ctx, svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	created_service := created_svc.(*api.Service)
+	serviceNodePorts := collectServiceNodePorts(created_service)
+	if !reflect.DeepEqual(serviceNodePorts, expectNodePorts) {
+		t.Errorf("Expected %v, but got %v", expectNodePorts, serviceNodePorts)
+	}
+	if storage.serviceNodePorts.Has(30053) {
+		t.Errorf("unexpected side effect: NodePort allocated")
+	}
+	srv, err = registry.GetService(ctx, svc.Name, &metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if srv != nil {
+		t.Errorf("unexpected service found: %v", srv)
+	}
+
+	// Test dry run create request with multiple unspecified node ports,
+	// so PortAllocationOperation.AllocateNext() will be called multiple times.
+	svc = &api.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+		Spec: api.ServiceSpec{
+			Selector:        map[string]string{"bar": "baz"},
+			SessionAffinity: api.ServiceAffinityNone,
+			Type:            api.ServiceTypeNodePort,
+			Ports: []api.ServicePort{
+				{
+					Name:       "port-a",
+					Port:       53,
+					Protocol:   api.ProtocolTCP,
+					TargetPort: intstr.FromInt(6503),
+				},
+				{
+					Name:       "port-b",
+					Port:       54,
+					Protocol:   api.ProtocolTCP,
+					TargetPort: intstr.FromInt(6504),
+				},
+			},
+		},
+	}
+	created_svc, err = storage.Create(ctx, svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	created_service = created_svc.(*api.Service)
+	serviceNodePorts = collectServiceNodePorts(created_service)
+	if len(serviceNodePorts) != 2 {
+		t.Errorf("Expected service to have 2 ports, but got %v", serviceNodePorts)
+	} else if serviceNodePorts[0] == serviceNodePorts[1] {
+		t.Errorf("Expected unique port numbers, but got %v", serviceNodePorts)
 	}
 }
 
 func TestServiceRegistryCreateMultiNodePortsService(t *testing.T) {
-	storage, registry, server := NewTestREST(t, nil)
+
+	storage, registry, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 
 	testCases := []struct {
@@ -410,7 +741,7 @@ func TestServiceRegistryCreateMultiNodePortsService(t *testing.T) {
 }
 
 func TestServiceStorageValidatesCreate(t *testing.T) {
-	storage, _, server := NewTestREST(t, nil)
+	storage, _, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 	failureCases := map[string]api.Service{
 		"empty ID": {
@@ -464,7 +795,7 @@ func TestServiceStorageValidatesCreate(t *testing.T) {
 
 func TestServiceRegistryUpdate(t *testing.T) {
 	ctx := genericapirequest.NewDefaultContext()
-	storage, registry, server := NewTestREST(t, nil)
+	storage, registry, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 
 	obj, err := registry.Create(ctx, &api.Service{
@@ -515,9 +846,175 @@ func TestServiceRegistryUpdate(t *testing.T) {
 	}
 }
 
+func TestServiceRegistryUpdateDryRun(t *testing.T) {
+
+	ctx := genericapirequest.NewDefaultContext()
+	storage, registry, server := NewTestREST(t, nil, false)
+	defer server.Terminate(t)
+
+	obj, err := registry.Create(ctx, &api.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo", ResourceVersion: "1", Namespace: metav1.NamespaceDefault},
+		Spec: api.ServiceSpec{
+			Selector:        map[string]string{"bar": "baz"},
+			SessionAffinity: api.ServiceAffinityNone,
+			Type:            api.ServiceTypeExternalName,
+			Ports: []api.ServicePort{{
+				Port:       6502,
+				Protocol:   api.ProtocolTCP,
+				TargetPort: intstr.FromInt(6502),
+			}},
+		},
+	}, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+	svc := obj.(*api.Service)
+	if err != nil {
+		t.Fatalf("Expected no error: %v", err)
+	}
+
+	// Test dry run update request external name to node port
+	updated_svc, created, err := storage.Update(ctx, svc.Name, rest.DefaultUpdatedObjectInfo(&api.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            svc.Name,
+			ResourceVersion: svc.ResourceVersion},
+		Spec: api.ServiceSpec{
+			Selector:        map[string]string{"bar": "baz"},
+			SessionAffinity: api.ServiceAffinityNone,
+			Type:            api.ServiceTypeNodePort,
+			Ports: []api.ServicePort{{
+				NodePort:   30020,
+				Port:       6502,
+				Protocol:   api.ProtocolTCP,
+				TargetPort: intstr.FromInt(6502),
+			}},
+		},
+	}), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{DryRun: []string{metav1.DryRunAll}})
+	if err != nil {
+		t.Fatalf("Expected no error: %v", err)
+	}
+	if updated_svc == nil {
+		t.Errorf("Expected non-nil object")
+	}
+	if created {
+		t.Errorf("expected not created")
+	}
+	if storage.serviceNodePorts.Has(30020) {
+		t.Errorf("unexpected side effect: NodePort allocated")
+	}
+	if e, a := "", registry.UpdatedID; e != a {
+		t.Errorf("Expected %q, but got %q", e, a)
+	}
+
+	// Test dry run update request external name to cluster ip
+	_, _, err = storage.Update(ctx, svc.Name, rest.DefaultUpdatedObjectInfo(&api.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            svc.Name,
+			ResourceVersion: svc.ResourceVersion},
+		Spec: api.ServiceSpec{
+			Selector:        map[string]string{"bar": "baz"},
+			SessionAffinity: api.ServiceAffinityNone,
+			Type:            api.ServiceTypeClusterIP,
+			ClusterIP:       "1.2.3.4",
+			Ports: []api.ServicePort{{
+				Port:       6502,
+				Protocol:   api.ProtocolTCP,
+				TargetPort: intstr.FromInt(6502),
+			}},
+		},
+	}), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{DryRun: []string{metav1.DryRunAll}})
+	if err != nil {
+		t.Fatalf("Expected no error: %v", err)
+	}
+	if storage.serviceIPs.Has(net.ParseIP("1.2.3.4")) {
+		t.Errorf("unexpected side effect: ip allocated")
+	}
+
+	// Test dry run update request remove node port
+	obj, err = storage.Create(ctx, &api.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo2", ResourceVersion: "1", Namespace: metav1.NamespaceDefault},
+		Spec: api.ServiceSpec{
+			Selector:        map[string]string{"bar": "baz"},
+			SessionAffinity: api.ServiceAffinityNone,
+			Type:            api.ServiceTypeNodePort,
+			Ports: []api.ServicePort{{
+				NodePort:   30020,
+				Port:       6502,
+				Protocol:   api.ProtocolTCP,
+				TargetPort: intstr.FromInt(6502),
+			}},
+		},
+	}, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+	svc = obj.(*api.Service)
+	if err != nil {
+		t.Fatalf("Expected no error: %v", err)
+	}
+	_, _, err = storage.Update(ctx, svc.Name, rest.DefaultUpdatedObjectInfo(&api.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            svc.Name,
+			ResourceVersion: svc.ResourceVersion},
+		Spec: api.ServiceSpec{
+			Selector:        map[string]string{"bar": "baz"},
+			SessionAffinity: api.ServiceAffinityNone,
+			Type:            api.ServiceTypeExternalName,
+			ExternalName:    "foo-svc",
+			Ports: []api.ServicePort{{
+				Port:       6502,
+				Protocol:   api.ProtocolTCP,
+				TargetPort: intstr.FromInt(6502),
+			}},
+		},
+	}), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{DryRun: []string{metav1.DryRunAll}})
+	if err != nil {
+		t.Fatalf("Expected no error: %v", err)
+	}
+	if !storage.serviceNodePorts.Has(30020) {
+		t.Errorf("unexpected side effect: NodePort unallocated")
+	}
+
+	// Test dry run update request remove cluster ip
+	obj, err = storage.Create(ctx, &api.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo3", ResourceVersion: "1", Namespace: metav1.NamespaceDefault},
+		Spec: api.ServiceSpec{
+			Selector:        map[string]string{"bar": "baz"},
+			SessionAffinity: api.ServiceAffinityNone,
+			Type:            api.ServiceTypeClusterIP,
+			ClusterIP:       "1.2.3.4",
+			Ports: []api.ServicePort{{
+				Port:       6502,
+				Protocol:   api.ProtocolTCP,
+				TargetPort: intstr.FromInt(6502),
+			}},
+		},
+	}, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+	svc = obj.(*api.Service)
+	if err != nil {
+		t.Fatalf("Expected no error: %v", err)
+	}
+	_, _, err = storage.Update(ctx, svc.Name, rest.DefaultUpdatedObjectInfo(&api.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            svc.Name,
+			ResourceVersion: svc.ResourceVersion},
+		Spec: api.ServiceSpec{
+			Selector:        map[string]string{"bar": "baz"},
+			SessionAffinity: api.ServiceAffinityNone,
+			Type:            api.ServiceTypeExternalName,
+			ExternalName:    "foo-svc",
+			Ports: []api.ServicePort{{
+				Port:       6502,
+				Protocol:   api.ProtocolTCP,
+				TargetPort: intstr.FromInt(6502),
+			}},
+		},
+	}), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{DryRun: []string{metav1.DryRunAll}})
+	if err != nil {
+		t.Fatalf("Expected no error: %v", err)
+	}
+	if !storage.serviceIPs.Has(net.ParseIP("1.2.3.4")) {
+		t.Errorf("unexpected side effect: ip unallocated")
+	}
+}
+
 func TestServiceStorageValidatesUpdate(t *testing.T) {
 	ctx := genericapirequest.NewDefaultContext()
-	storage, registry, server := NewTestREST(t, nil)
+	storage, registry, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 	registry.Create(ctx, &api.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo"},
@@ -570,7 +1067,7 @@ func TestServiceStorageValidatesUpdate(t *testing.T) {
 
 func TestServiceRegistryExternalService(t *testing.T) {
 	ctx := genericapirequest.NewDefaultContext()
-	storage, registry, server := NewTestREST(t, nil)
+	storage, registry, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 	svc := &api.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo"},
@@ -609,7 +1106,7 @@ func TestServiceRegistryExternalService(t *testing.T) {
 
 func TestServiceRegistryDelete(t *testing.T) {
 	ctx := genericapirequest.NewDefaultContext()
-	storage, registry, server := NewTestREST(t, nil)
+	storage, registry, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 	svc := &api.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo"},
@@ -624,15 +1121,81 @@ func TestServiceRegistryDelete(t *testing.T) {
 		},
 	}
 	registry.Create(ctx, svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
-	storage.Delete(ctx, svc.Name, &metav1.DeleteOptions{})
+	storage.Delete(ctx, svc.Name, rest.ValidateAllObjectFunc, &metav1.DeleteOptions{})
 	if e, a := "foo", registry.DeletedID; e != a {
 		t.Errorf("Expected %v, but got %v", e, a)
 	}
 }
 
+func TestServiceRegistryDeleteDryRun(t *testing.T) {
+	ctx := genericapirequest.NewDefaultContext()
+	storage, registry, server := NewTestREST(t, nil, false)
+	defer server.Terminate(t)
+
+	// Test dry run delete request with cluster ip
+	svc := &api.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+		Spec: api.ServiceSpec{
+			Selector:        map[string]string{"bar": "baz"},
+			SessionAffinity: api.ServiceAffinityNone,
+			Type:            api.ServiceTypeClusterIP,
+			ClusterIP:       "1.2.3.4",
+			Ports: []api.ServicePort{{
+				Port:       6502,
+				Protocol:   api.ProtocolTCP,
+				TargetPort: intstr.FromInt(6502),
+			}},
+		},
+	}
+	_, err := storage.Create(ctx, svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Expected no error: %v", err)
+	}
+	_, _, err = storage.Delete(ctx, svc.Name, rest.ValidateAllObjectFunc, &metav1.DeleteOptions{DryRun: []string{metav1.DryRunAll}})
+	if err != nil {
+		t.Fatalf("Expected no error: %v", err)
+	}
+	if e, a := "", registry.DeletedID; e != a {
+		t.Errorf("Expected %v, but got %v", e, a)
+	}
+	if !storage.serviceIPs.Has(net.ParseIP("1.2.3.4")) {
+		t.Errorf("unexpected side effect: ip unallocated")
+	}
+
+	// Test dry run delete request with node port
+	svc = &api.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo2"},
+		Spec: api.ServiceSpec{
+			Selector:        map[string]string{"bar": "baz"},
+			SessionAffinity: api.ServiceAffinityNone,
+			Type:            api.ServiceTypeNodePort,
+			Ports: []api.ServicePort{{
+				NodePort:   30030,
+				Port:       6502,
+				Protocol:   api.ProtocolTCP,
+				TargetPort: intstr.FromInt(6502),
+			}},
+		},
+	}
+	_, err = storage.Create(ctx, svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Expected no error: %v", err)
+	}
+	_, _, err = storage.Delete(ctx, svc.Name, rest.ValidateAllObjectFunc, &metav1.DeleteOptions{DryRun: []string{metav1.DryRunAll}})
+	if err != nil {
+		t.Fatalf("Expected no error: %v", err)
+	}
+	if e, a := "", registry.DeletedID; e != a {
+		t.Errorf("Expected %v, but got %v", e, a)
+	}
+	if !storage.serviceNodePorts.Has(30030) {
+		t.Errorf("unexpected side effect: NodePort unallocated")
+	}
+}
+
 func TestServiceRegistryDeleteExternal(t *testing.T) {
 	ctx := genericapirequest.NewDefaultContext()
-	storage, registry, server := NewTestREST(t, nil)
+	storage, registry, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 	svc := &api.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo"},
@@ -647,7 +1210,7 @@ func TestServiceRegistryDeleteExternal(t *testing.T) {
 		},
 	}
 	registry.Create(ctx, svc, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
-	storage.Delete(ctx, svc.Name, &metav1.DeleteOptions{})
+	storage.Delete(ctx, svc.Name, rest.ValidateAllObjectFunc, &metav1.DeleteOptions{})
 	if e, a := "foo", registry.DeletedID; e != a {
 		t.Errorf("Expected %v, but got %v", e, a)
 	}
@@ -655,7 +1218,7 @@ func TestServiceRegistryDeleteExternal(t *testing.T) {
 
 func TestServiceRegistryUpdateExternalService(t *testing.T) {
 	ctx := genericapirequest.NewDefaultContext()
-	storage, registry, server := NewTestREST(t, nil)
+	storage, registry, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 
 	// Create non-external load balancer.
@@ -694,7 +1257,7 @@ func TestServiceRegistryUpdateExternalService(t *testing.T) {
 
 func TestServiceRegistryUpdateMultiPortExternalService(t *testing.T) {
 	ctx := genericapirequest.NewDefaultContext()
-	storage, registry, server := NewTestREST(t, nil)
+	storage, registry, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 
 	// Create external load balancer.
@@ -732,7 +1295,7 @@ func TestServiceRegistryUpdateMultiPortExternalService(t *testing.T) {
 
 func TestServiceRegistryGet(t *testing.T) {
 	ctx := genericapirequest.NewDefaultContext()
-	storage, registry, server := NewTestREST(t, nil)
+	storage, registry, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 	registry.Create(ctx, &api.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo"},
@@ -789,7 +1352,7 @@ func TestServiceRegistryResourceLocation(t *testing.T) {
 					Containers:    []api.Container{{Name: "bar", Image: "test", ImagePullPolicy: api.PullIfNotPresent, TerminationMessagePolicy: api.TerminationMessageReadFile}},
 				},
 				Status: api.PodStatus{
-					PodIP: "1.2.3.4",
+					PodIPs: []api.PodIP{{IP: "1.2.3.4"}, {IP: "2001:db7::"}},
 				},
 			},
 			{
@@ -803,12 +1366,12 @@ func TestServiceRegistryResourceLocation(t *testing.T) {
 					Containers:    []api.Container{{Name: "bar", Image: "test", ImagePullPolicy: api.PullIfNotPresent, TerminationMessagePolicy: api.TerminationMessageReadFile}},
 				},
 				Status: api.PodStatus{
-					PodIP: "1.2.3.5",
+					PodIPs: []api.PodIP{{IP: "1.2.3.5"}, {IP: "2001:db8::"}},
 				},
 			},
 		},
 	}
-	storage, registry, server := NewTestRESTWithPods(t, endpoints, pods)
+	storage, registry, server := NewTestRESTWithPods(t, endpoints, pods, false)
 	defer server.Terminate(t)
 	for _, name := range []string{"foo", "bad"} {
 		registry.Create(ctx, &api.Service{
@@ -908,7 +1471,7 @@ func TestServiceRegistryResourceLocation(t *testing.T) {
 
 func TestServiceRegistryList(t *testing.T) {
 	ctx := genericapirequest.NewDefaultContext()
-	storage, registry, server := NewTestREST(t, nil)
+	storage, registry, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 	registry.Create(ctx, &api.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: metav1.NamespaceDefault},
@@ -940,7 +1503,7 @@ func TestServiceRegistryList(t *testing.T) {
 }
 
 func TestServiceRegistryIPAllocation(t *testing.T) {
-	storage, _, server := NewTestREST(t, nil)
+	storage, _, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 
 	svc1 := &api.Service{
@@ -1023,7 +1586,7 @@ func TestServiceRegistryIPAllocation(t *testing.T) {
 }
 
 func TestServiceRegistryIPReallocation(t *testing.T) {
-	storage, _, server := NewTestREST(t, nil)
+	storage, _, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 
 	svc1 := &api.Service{
@@ -1049,7 +1612,7 @@ func TestServiceRegistryIPReallocation(t *testing.T) {
 		t.Errorf("Unexpected ClusterIP: %s", created_service_1.Spec.ClusterIP)
 	}
 
-	_, _, err := storage.Delete(ctx, created_service_1.Name, &metav1.DeleteOptions{})
+	_, _, err := storage.Delete(ctx, created_service_1.Name, rest.ValidateAllObjectFunc, &metav1.DeleteOptions{})
 	if err != nil {
 		t.Errorf("Unexpected error deleting service: %v", err)
 	}
@@ -1079,7 +1642,7 @@ func TestServiceRegistryIPReallocation(t *testing.T) {
 }
 
 func TestServiceRegistryIPUpdate(t *testing.T) {
-	storage, _, server := NewTestREST(t, nil)
+	storage, _, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 
 	svc := &api.Service{
@@ -1134,7 +1697,7 @@ func TestServiceRegistryIPUpdate(t *testing.T) {
 }
 
 func TestServiceRegistryIPLoadBalancer(t *testing.T) {
-	storage, registry, server := NewTestREST(t, nil)
+	storage, registry, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 
 	svc := &api.Service{
@@ -1174,7 +1737,7 @@ func TestServiceRegistryIPLoadBalancer(t *testing.T) {
 }
 
 func TestUpdateServiceWithConflictingNamespace(t *testing.T) {
-	storage, _, server := NewTestREST(t, nil)
+	storage, _, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 	service := &api.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "not-default"},
@@ -1196,7 +1759,7 @@ func TestUpdateServiceWithConflictingNamespace(t *testing.T) {
 // and type is LoadBalancer.
 func TestServiceRegistryExternalTrafficHealthCheckNodePortAllocation(t *testing.T) {
 	ctx := genericapirequest.NewDefaultContext()
-	storage, registry, server := NewTestREST(t, nil)
+	storage, registry, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 	svc := &api.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "external-lb-esipp"},
@@ -1236,7 +1799,7 @@ func TestServiceRegistryExternalTrafficHealthCheckNodePortAllocation(t *testing.
 func TestServiceRegistryExternalTrafficHealthCheckNodePortUserAllocation(t *testing.T) {
 	randomNodePort := generateRandomNodePort()
 	ctx := genericapirequest.NewDefaultContext()
-	storage, registry, server := NewTestREST(t, nil)
+	storage, registry, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 	svc := &api.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "external-lb-esipp"},
@@ -1279,7 +1842,7 @@ func TestServiceRegistryExternalTrafficHealthCheckNodePortUserAllocation(t *test
 // Validate that the service creation fails when the requested port number is -1.
 func TestServiceRegistryExternalTrafficHealthCheckNodePortNegative(t *testing.T) {
 	ctx := genericapirequest.NewDefaultContext()
-	storage, _, server := NewTestREST(t, nil)
+	storage, _, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 	svc := &api.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "external-lb-esipp"},
@@ -1306,7 +1869,7 @@ func TestServiceRegistryExternalTrafficHealthCheckNodePortNegative(t *testing.T)
 // Validate that the health check nodePort is not allocated when ExternalTrafficPolicy is set to Global.
 func TestServiceRegistryExternalTrafficGlobal(t *testing.T) {
 	ctx := genericapirequest.NewDefaultContext()
-	storage, registry, server := NewTestREST(t, nil)
+	storage, registry, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
 	svc := &api.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "external-lb-esipp"},
@@ -1342,13 +1905,17 @@ func TestServiceRegistryExternalTrafficGlobal(t *testing.T) {
 }
 
 func TestInitClusterIP(t *testing.T) {
-	storage, _, server := NewTestREST(t, nil)
-	defer server.Terminate(t)
-
+	ipv4Service := api.IPv4Protocol
+	ipv6Service := api.IPv6Protocol
 	testCases := []struct {
-		name            string
-		svc             *api.Service
-		expectClusterIP bool
+		name string
+		svc  *api.Service
+
+		expectClusterIP     bool
+		enableDualStack     bool
+		allocateSpecificIP  bool
+		useSecondaryAlloc   bool
+		expectedAllocatedIP string
 	}{
 		{
 			name: "Allocate new ClusterIP",
@@ -1366,6 +1933,27 @@ func TestInitClusterIP(t *testing.T) {
 				},
 			},
 			expectClusterIP: true,
+			enableDualStack: false,
+		},
+		{
+			name: "Allocate new ClusterIP-v6",
+			svc: &api.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+				Spec: api.ServiceSpec{
+					Selector:        map[string]string{"bar": "baz"},
+					SessionAffinity: api.ServiceAffinityNone,
+					Type:            api.ServiceTypeClusterIP,
+					IPFamily:        &ipv6Service,
+					Ports: []api.ServicePort{{
+						Port:       6502,
+						Protocol:   api.ProtocolTCP,
+						TargetPort: intstr.FromInt(6502),
+					}},
+				},
+			},
+			expectClusterIP:   true,
+			useSecondaryAlloc: true,
+			enableDualStack:   true,
 		},
 		{
 			name: "Allocate specified ClusterIP",
@@ -1375,6 +1963,7 @@ func TestInitClusterIP(t *testing.T) {
 					Selector:        map[string]string{"bar": "baz"},
 					SessionAffinity: api.ServiceAffinityNone,
 					Type:            api.ServiceTypeClusterIP,
+					IPFamily:        &ipv4Service,
 					ClusterIP:       "1.2.3.4",
 					Ports: []api.ServicePort{{
 						Port:       6502,
@@ -1383,7 +1972,33 @@ func TestInitClusterIP(t *testing.T) {
 					}},
 				},
 			},
-			expectClusterIP: true,
+			expectClusterIP:     true,
+			allocateSpecificIP:  true,
+			expectedAllocatedIP: "1.2.3.4",
+			enableDualStack:     true,
+		},
+		{
+			name: "Allocate specified ClusterIP-v6",
+			svc: &api.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+				Spec: api.ServiceSpec{
+					Selector:        map[string]string{"bar": "baz"},
+					SessionAffinity: api.ServiceAffinityNone,
+					Type:            api.ServiceTypeClusterIP,
+					IPFamily:        &ipv6Service,
+					ClusterIP:       "2000:0:0:0:0:0:0:1",
+					Ports: []api.ServicePort{{
+						Port:       6502,
+						Protocol:   api.ProtocolTCP,
+						TargetPort: intstr.FromInt(6502),
+					}},
+				},
+			},
+			expectClusterIP:     true,
+			allocateSpecificIP:  true,
+			expectedAllocatedIP: "2000:0:0:0:0:0:0:1",
+			useSecondaryAlloc:   true,
+			enableDualStack:     true,
 		},
 		{
 			name: "Shouldn't allocate ClusterIP",
@@ -1406,37 +2021,43 @@ func TestInitClusterIP(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		hasAllocatedIP, err := initClusterIP(test.svc, storage.serviceIPs)
-		if err != nil {
-			t.Errorf("%q: unexpected error: %v", test.name, err)
-		}
+		t.Run(test.name, func(t *testing.T) {
 
-		if hasAllocatedIP != test.expectClusterIP {
-			t.Errorf("%q: expected %v, but got %v", test.name, test.expectClusterIP, hasAllocatedIP)
-		}
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.IPv6DualStack, test.enableDualStack)()
 
-		if test.expectClusterIP {
-			if !storage.serviceIPs.Has(net.ParseIP(test.svc.Spec.ClusterIP)) {
-				t.Errorf("%q: unexpected ClusterIP %q, out of range", test.name, test.svc.Spec.ClusterIP)
+			storage, _, server := NewTestREST(t, nil, test.enableDualStack)
+			defer server.Terminate(t)
+
+			whichAlloc := allocGet(storage, test.useSecondaryAlloc)
+			hasAllocatedIP, err := initClusterIP(test.svc, whichAlloc)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
 			}
-		}
 
-		if test.name == "Allocate specified ClusterIP" && test.svc.Spec.ClusterIP != "1.2.3.4" {
-			t.Errorf("%q: expected ClusterIP %q, but got %q", test.name, "1.2.3.4", test.svc.Spec.ClusterIP)
-		}
-
-		if hasAllocatedIP {
-			if helper.IsServiceIPSet(test.svc) {
-				storage.serviceIPs.Release(net.ParseIP(test.svc.Spec.ClusterIP))
+			if hasAllocatedIP != test.expectClusterIP {
+				t.Errorf("expected %v, but got %v", test.expectClusterIP, hasAllocatedIP)
 			}
-		}
+
+			if test.expectClusterIP {
+				alloc := allocGet(storage, test.useSecondaryAlloc)
+				if !alloc.Has(net.ParseIP(test.svc.Spec.ClusterIP)) {
+					t.Errorf("unexpected ClusterIP %q, out of range", test.svc.Spec.ClusterIP)
+				}
+			}
+
+			if test.allocateSpecificIP && test.expectedAllocatedIP != test.svc.Spec.ClusterIP {
+				t.Errorf(" expected ClusterIP %q, but got %q", test.expectedAllocatedIP, test.svc.Spec.ClusterIP)
+			}
+
+		})
 	}
+
 }
 
 func TestInitNodePorts(t *testing.T) {
-	storage, _, server := NewTestREST(t, nil)
+	storage, _, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
-	nodePortOp := portallocator.StartOperation(storage.serviceNodePorts)
+	nodePortOp := portallocator.StartOperation(storage.serviceNodePorts, false)
 	defer nodePortOp.Finish()
 
 	testCases := []struct {
@@ -1616,9 +2237,9 @@ func TestInitNodePorts(t *testing.T) {
 }
 
 func TestUpdateNodePorts(t *testing.T) {
-	storage, _, server := NewTestREST(t, nil)
+	storage, _, server := NewTestREST(t, nil, false)
 	defer server.Terminate(t)
-	nodePortOp := portallocator.StartOperation(storage.serviceNodePorts)
+	nodePortOp := portallocator.StartOperation(storage.serviceNodePorts, false)
 	defer nodePortOp.Finish()
 
 	testCases := []struct {
@@ -1883,4 +2504,143 @@ func TestUpdateNodePorts(t *testing.T) {
 			storage.serviceNodePorts.Release(nodePort)
 		}
 	}
+}
+
+func TestAllocGetters(t *testing.T) {
+	ipv4Service := api.IPv4Protocol
+	ipv6Service := api.IPv6Protocol
+
+	testCases := []struct {
+		name string
+
+		enableDualStack        bool
+		specExpctPrimary       bool
+		clusterIPExpectPrimary bool
+
+		svc *api.Service
+	}{
+		{
+			name: "spec:v4 ip:v4 dualstack:off",
+
+			specExpctPrimary:       true,
+			clusterIPExpectPrimary: true,
+			enableDualStack:        false,
+
+			svc: &api.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo", ResourceVersion: "1"},
+				Spec: api.ServiceSpec{
+					Selector:  map[string]string{"bar": "baz"},
+					Type:      api.ServiceTypeClusterIP,
+					IPFamily:  &ipv4Service,
+					ClusterIP: "10.0.0.1",
+				},
+			},
+		},
+		{
+			name: "spec:v4 ip:v4 dualstack:on",
+
+			specExpctPrimary:       true,
+			clusterIPExpectPrimary: true,
+			enableDualStack:        true,
+
+			svc: &api.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo", ResourceVersion: "1"},
+				Spec: api.ServiceSpec{
+					Selector:  map[string]string{"bar": "baz"},
+					Type:      api.ServiceTypeClusterIP,
+					IPFamily:  &ipv4Service,
+					ClusterIP: "10.0.0.1",
+				},
+			},
+		},
+
+		{
+			name: "spec:v4 ip:v6 dualstack:on",
+
+			specExpctPrimary:       true,
+			clusterIPExpectPrimary: false,
+			enableDualStack:        true,
+
+			svc: &api.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo", ResourceVersion: "1"},
+				Spec: api.ServiceSpec{
+					Selector:  map[string]string{"bar": "baz"},
+					Type:      api.ServiceTypeClusterIP,
+					IPFamily:  &ipv4Service,
+					ClusterIP: "2000::1",
+				},
+			},
+		},
+
+		{
+			name: "spec:v6 ip:v6 dualstack:on",
+
+			specExpctPrimary:       false,
+			clusterIPExpectPrimary: false,
+			enableDualStack:        true,
+
+			svc: &api.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo", ResourceVersion: "1"},
+				Spec: api.ServiceSpec{
+					Selector:  map[string]string{"bar": "baz"},
+					Type:      api.ServiceTypeClusterIP,
+					IPFamily:  &ipv6Service,
+					ClusterIP: "2000::1",
+				},
+			},
+		},
+
+		{
+			name: "spec:v6 ip:v4 dualstack:on",
+
+			specExpctPrimary:       false,
+			clusterIPExpectPrimary: true,
+			enableDualStack:        true,
+
+			svc: &api.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo", ResourceVersion: "1"},
+				Spec: api.ServiceSpec{
+					Selector:  map[string]string{"bar": "baz"},
+					Type:      api.ServiceTypeClusterIP,
+					IPFamily:  &ipv6Service,
+					ClusterIP: "10.0.0.10",
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.IPv6DualStack, tc.enableDualStack)()
+			storage, _, server := NewTestREST(t, nil, tc.enableDualStack)
+			defer server.Terminate(t)
+
+			if tc.enableDualStack && storage.secondaryServiceIPs == nil {
+				t.Errorf("storage must allocate secondary ServiceIPs allocator for dual stack")
+				return
+			}
+
+			alloc := storage.getAllocatorByClusterIP(tc.svc)
+			if tc.clusterIPExpectPrimary && !bytes.Equal(alloc.CIDR().IP, storage.serviceIPs.CIDR().IP) {
+				t.Errorf("expected primary allocator, but primary allocator was not selected")
+				return
+			}
+
+			if tc.enableDualStack && !tc.clusterIPExpectPrimary && !bytes.Equal(alloc.CIDR().IP, storage.secondaryServiceIPs.CIDR().IP) {
+				t.Errorf("expected secondary allocator, but secondary allocator was not selected")
+			}
+
+			alloc = storage.getAllocatorBySpec(tc.svc)
+			if tc.specExpctPrimary && !bytes.Equal(alloc.CIDR().IP, storage.serviceIPs.CIDR().IP) {
+				t.Errorf("expected primary allocator, but primary allocator was not selected")
+				return
+			}
+
+			if tc.enableDualStack && !tc.specExpctPrimary && !bytes.Equal(alloc.CIDR().IP, storage.secondaryServiceIPs.CIDR().IP) {
+				t.Errorf("expected secondary allocator, but secondary allocator was not selected")
+			}
+
+		})
+	}
+
 }

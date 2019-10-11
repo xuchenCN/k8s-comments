@@ -3,15 +3,16 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library")
 go_library(
     name = "go_default_library",
     srcs = [
+        "aliases.go",
         "asm_windows_386.s",
         "asm_windows_amd64.s",
         "dll_windows.go",
-        "env_unset.go",
         "env_windows.go",
         "eventlog.go",
         "exec_windows.go",
         "memory_windows.go",
         "mksyscall.go",
+        "race.go",
         "race0.go",
         "security_windows.go",
         "service.go",
@@ -39,6 +40,7 @@ filegroup(
     name = "all-srcs",
     srcs = [
         ":package-srcs",
+        "//vendor/golang.org/x/sys/windows/registry:all-srcs",
         "//vendor/golang.org/x/sys/windows/svc:all-srcs",
     ],
     tags = ["automanaged"],

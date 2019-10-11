@@ -17,6 +17,7 @@ limitations under the License.
 package webhook
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -28,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"text/template"
 	"time"
@@ -396,7 +398,7 @@ func TestTLSConfig(t *testing.T) {
 
 			// Allow all and see if we get an error.
 			service.Allow()
-			decision, _, err := wh.Authorize(attr)
+			decision, _, err := wh.Authorize(context.Background(), attr)
 			if tt.wantAuth {
 				if decision != authorizer.DecisionAllow {
 					t.Errorf("expected successful authorization")
@@ -418,7 +420,7 @@ func TestTLSConfig(t *testing.T) {
 			}
 
 			service.Deny()
-			if decision, _, _ := wh.Authorize(attr); decision == authorizer.DecisionAllow {
+			if decision, _, _ := wh.Authorize(context.Background(), attr); decision == authorizer.DecisionAllow {
 				t.Errorf("%s: incorrectly authorized with DenyAll policy", tt.test)
 			}
 		}()
@@ -479,7 +481,7 @@ func TestWebhook(t *testing.T) {
 			want: v1beta1.SubjectAccessReview{
 				TypeMeta: expTypeMeta,
 				Spec: v1beta1.SubjectAccessReviewSpec{
-					User: "jane",
+					User:                  "jane",
 					NonResourceAttributes: &v1beta1.NonResourceAttributes{},
 				},
 			},
@@ -522,7 +524,7 @@ func TestWebhook(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		decision, _, err := wh.Authorize(tt.attr)
+		decision, _, err := wh.Authorize(context.Background(), tt.attr)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -538,41 +540,6 @@ func TestWebhook(t *testing.T) {
 		}
 		if !reflect.DeepEqual(gotAttr, tt.want) {
 			t.Errorf("case %d: got != want:\n%s", i, diff.ObjectGoPrintDiff(gotAttr, tt.want))
-		}
-	}
-}
-
-type webhookCacheTestCase struct {
-	attr authorizer.AttributesRecord
-
-	allow      bool
-	statusCode int
-
-	expectedErr        bool
-	expectedAuthorized bool
-	expectedCalls      int
-}
-
-func testWebhookCacheCases(t *testing.T, serv *mockService, wh *WebhookAuthorizer, tests []webhookCacheTestCase) {
-	for i, test := range tests {
-		serv.called = 0
-		serv.allow = test.allow
-		serv.statusCode = test.statusCode
-		authorized, _, err := wh.Authorize(test.attr)
-		if test.expectedErr && err == nil {
-			t.Errorf("%d: Expected error", i)
-			continue
-		} else if !test.expectedErr && err != nil {
-			t.Errorf("%d: unexpected error: %v", i, err)
-			continue
-		}
-
-		if test.expectedAuthorized != (authorized == authorizer.DecisionAllow) {
-			t.Errorf("%d: expected authorized=%v, got %v", i, test.expectedAuthorized, authorized)
-		}
-
-		if test.expectedCalls != serv.called {
-			t.Errorf("%d: expected %d calls, got %d", i, test.expectedCalls, serv.called)
 		}
 	}
 }
@@ -595,27 +562,86 @@ func TestWebhookCache(t *testing.T) {
 
 	aliceAttr := authorizer.AttributesRecord{User: &user.DefaultInfo{Name: "alice"}}
 	bobAttr := authorizer.AttributesRecord{User: &user.DefaultInfo{Name: "bob"}}
+	aliceRidiculousAttr := authorizer.AttributesRecord{
+		User:            &user.DefaultInfo{Name: "alice"},
+		ResourceRequest: true,
+		Verb:            strings.Repeat("v", 2000),
+		APIGroup:        strings.Repeat("g", 2000),
+		APIVersion:      strings.Repeat("a", 2000),
+		Resource:        strings.Repeat("r", 2000),
+		Name:            strings.Repeat("n", 2000),
+	}
+	bobRidiculousAttr := authorizer.AttributesRecord{
+		User:            &user.DefaultInfo{Name: "bob"},
+		ResourceRequest: true,
+		Verb:            strings.Repeat("v", 2000),
+		APIGroup:        strings.Repeat("g", 2000),
+		APIVersion:      strings.Repeat("a", 2000),
+		Resource:        strings.Repeat("r", 2000),
+		Name:            strings.Repeat("n", 2000),
+	}
+
+	type webhookCacheTestCase struct {
+		name string
+
+		attr authorizer.AttributesRecord
+
+		allow      bool
+		statusCode int
+
+		expectedErr        bool
+		expectedAuthorized bool
+		expectedCalls      int
+	}
 
 	tests := []webhookCacheTestCase{
 		// server error and 429's retry
-		{attr: aliceAttr, allow: false, statusCode: 500, expectedErr: true, expectedAuthorized: false, expectedCalls: 5},
-		{attr: aliceAttr, allow: false, statusCode: 429, expectedErr: true, expectedAuthorized: false, expectedCalls: 5},
+		{name: "server errors retry", attr: aliceAttr, allow: false, statusCode: 500, expectedErr: true, expectedAuthorized: false, expectedCalls: 5},
+		{name: "429s retry", attr: aliceAttr, allow: false, statusCode: 429, expectedErr: true, expectedAuthorized: false, expectedCalls: 5},
 		// regular errors return errors but do not retry
-		{attr: aliceAttr, allow: false, statusCode: 404, expectedErr: true, expectedAuthorized: false, expectedCalls: 1},
-		{attr: aliceAttr, allow: false, statusCode: 403, expectedErr: true, expectedAuthorized: false, expectedCalls: 1},
-		{attr: aliceAttr, allow: false, statusCode: 401, expectedErr: true, expectedAuthorized: false, expectedCalls: 1},
+		{name: "404 doesnt retry", attr: aliceAttr, allow: false, statusCode: 404, expectedErr: true, expectedAuthorized: false, expectedCalls: 1},
+		{name: "403 doesnt retry", attr: aliceAttr, allow: false, statusCode: 403, expectedErr: true, expectedAuthorized: false, expectedCalls: 1},
+		{name: "401 doesnt retry", attr: aliceAttr, allow: false, statusCode: 401, expectedErr: true, expectedAuthorized: false, expectedCalls: 1},
 		// successful responses are cached
-		{attr: aliceAttr, allow: true, statusCode: 200, expectedErr: false, expectedAuthorized: true, expectedCalls: 1},
+		{name: "alice successful request", attr: aliceAttr, allow: true, statusCode: 200, expectedErr: false, expectedAuthorized: true, expectedCalls: 1},
 		// later requests within the cache window don't hit the backend
-		{attr: aliceAttr, allow: false, statusCode: 500, expectedErr: false, expectedAuthorized: true, expectedCalls: 0},
+		{name: "alice cached request", attr: aliceAttr, allow: false, statusCode: 500, expectedErr: false, expectedAuthorized: true, expectedCalls: 0},
 
 		// a request with different attributes doesn't hit the cache
-		{attr: bobAttr, allow: false, statusCode: 500, expectedErr: true, expectedAuthorized: false, expectedCalls: 5},
+		{name: "bob failed request", attr: bobAttr, allow: false, statusCode: 500, expectedErr: true, expectedAuthorized: false, expectedCalls: 5},
 		// successful response for other attributes is cached
-		{attr: bobAttr, allow: true, statusCode: 200, expectedErr: false, expectedAuthorized: true, expectedCalls: 1},
+		{name: "bob unauthorized request", attr: bobAttr, allow: false, statusCode: 200, expectedErr: false, expectedAuthorized: false, expectedCalls: 1},
 		// later requests within the cache window don't hit the backend
-		{attr: bobAttr, allow: false, statusCode: 500, expectedErr: false, expectedAuthorized: true, expectedCalls: 0},
+		{name: "bob unauthorized cached request", attr: bobAttr, allow: false, statusCode: 500, expectedErr: false, expectedAuthorized: false, expectedCalls: 0},
+		// ridiculous unauthorized requests are not cached.
+		{name: "ridiculous unauthorized request", attr: bobRidiculousAttr, allow: false, statusCode: 200, expectedErr: false, expectedAuthorized: false, expectedCalls: 1},
+		// later ridiculous requests within the cache window still hit the backend
+		{name: "ridiculous unauthorized request again", attr: bobRidiculousAttr, allow: false, statusCode: 200, expectedErr: false, expectedAuthorized: false, expectedCalls: 1},
+		// ridiculous authorized requests are not cached.
+		{name: "ridiculous authorized request", attr: aliceRidiculousAttr, allow: true, statusCode: 200, expectedErr: false, expectedAuthorized: true, expectedCalls: 1},
+		// later ridiculous requests within the cache window still hit the backend
+		{name: "ridiculous authorized request again", attr: aliceRidiculousAttr, allow: true, statusCode: 200, expectedErr: false, expectedAuthorized: true, expectedCalls: 1},
 	}
 
-	testWebhookCacheCases(t, serv, wh, tests)
+	for i, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			serv.called = 0
+			serv.allow = test.allow
+			serv.statusCode = test.statusCode
+			authorized, _, err := wh.Authorize(context.Background(), test.attr)
+			if test.expectedErr && err == nil {
+				t.Fatalf("%d: Expected error", i)
+			} else if !test.expectedErr && err != nil {
+				t.Fatalf("%d: unexpected error: %v", i, err)
+			}
+
+			if test.expectedAuthorized != (authorized == authorizer.DecisionAllow) {
+				t.Errorf("%d: expected authorized=%v, got %v", i, test.expectedAuthorized, authorized)
+			}
+
+			if test.expectedCalls != serv.called {
+				t.Errorf("%d: expected %d calls, got %d", i, test.expectedCalls, serv.called)
+			}
+		})
+	}
 }

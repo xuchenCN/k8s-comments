@@ -20,17 +20,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 
-	"github.com/golang/glog"
-	"k8s.io/api/core/v1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
-	clientv1core "k8s.io/client-go/kubernetes/typed/core/v1"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
+	"k8s.io/klog"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
-	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler"
-	"k8s.io/kubernetes/pkg/scheduler/factory"
+
+	// import DefaultProvider
+	_ "k8s.io/kubernetes/pkg/scheduler/algorithmprovider/defaults"
+	schedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
+	schedulerplugins "k8s.io/kubernetes/pkg/scheduler/framework/plugins"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
@@ -48,70 +49,83 @@ func StartApiserver() (string, ShutdownFunc) {
 	framework.RunAMasterUsingServer(framework.NewIntegrationTestMasterConfig(), s, h)
 
 	shutdownFunc := func() {
-		glog.Infof("destroying API server")
+		klog.Infof("destroying API server")
 		s.Close()
-		glog.Infof("destroyed API server")
+		klog.Infof("destroyed API server")
 	}
 	return s.URL, shutdownFunc
 }
 
 // StartScheduler configures and starts a scheduler given a handle to the clientSet interface
-// and event broadcaster. It returns a handle to the configurator for the running scheduler
-// and the shutdown function to stop it.
-func StartScheduler(clientSet clientset.Interface) (scheduler.Configurator, ShutdownFunc) {
+// and event broadcaster. It returns the running scheduler and the shutdown function to stop it.
+func StartScheduler(clientSet clientset.Interface) (*scheduler.Scheduler, ShutdownFunc) {
 	informerFactory := informers.NewSharedInformerFactory(clientSet, 0)
+	stopCh := make(chan struct{})
+	evtBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{
+		Interface: clientSet.EventsV1beta1().Events("")})
 
-	evtBroadcaster := record.NewBroadcaster()
-	evtWatch := evtBroadcaster.StartRecordingToSink(&clientv1core.EventSinkImpl{
-		Interface: clientSet.CoreV1().Events("")})
+	evtBroadcaster.StartRecordingToSink(stopCh)
 
-	schedulerConfigurator := createSchedulerConfigurator(clientSet, informerFactory)
+	recorder := evtBroadcaster.NewRecorder(
+		legacyscheme.Scheme,
+		v1.DefaultSchedulerName,
+	)
 
-	sched, err := scheduler.NewFromConfigurator(schedulerConfigurator, func(conf *scheduler.Config) {
-		conf.Recorder = evtBroadcaster.NewRecorder(legacyscheme.Scheme, v1.EventSource{Component: "scheduler"})
-	})
+	sched, err := createScheduler(clientSet, informerFactory, recorder, stopCh)
 	if err != nil {
-		glog.Fatalf("Error creating scheduler: %v", err)
+		klog.Fatalf("Error creating scheduler: %v", err)
 	}
+	scheduler.AddAllEventHandlers(sched,
+		v1.DefaultSchedulerName,
+		informerFactory.Core().V1().Nodes(),
+		informerFactory.Core().V1().Pods(),
+		informerFactory.Core().V1().PersistentVolumes(),
+		informerFactory.Core().V1().PersistentVolumeClaims(),
+		informerFactory.Core().V1().Services(),
+		informerFactory.Storage().V1().StorageClasses(),
+		informerFactory.Storage().V1beta1().CSINodes(),
+	)
 
-	stop := make(chan struct{})
-	informerFactory.Start(stop)
-
+	informerFactory.Start(stopCh)
 	sched.Run()
 
 	shutdownFunc := func() {
-		glog.Infof("destroying scheduler")
-		evtWatch.Stop()
-		sched.StopEverything()
-		close(stop)
-		glog.Infof("destroyed scheduler")
+		klog.Infof("destroying scheduler")
+		close(stopCh)
+		klog.Infof("destroyed scheduler")
 	}
-	return schedulerConfigurator, shutdownFunc
+	return sched, shutdownFunc
 }
 
-// createSchedulerConfigurator create a configurator for scheduler with given informer factory and default name.
-func createSchedulerConfigurator(
+// createScheduler create a scheduler with given informer factory and default name.
+func createScheduler(
 	clientSet clientset.Interface,
 	informerFactory informers.SharedInformerFactory,
-) scheduler.Configurator {
-	// Enable EnableEquivalenceClassCache for all integration tests.
-	utilfeature.DefaultFeatureGate.Set("EnableEquivalenceClassCache=true")
+	recorder events.EventRecorder,
+	stopCh <-chan struct{},
+) (*scheduler.Scheduler, error) {
+	defaultProviderName := schedulerconfig.SchedulerDefaultProviderName
 
-	return factory.NewConfigFactory(
-		v1.DefaultSchedulerName,
+	return scheduler.New(
 		clientSet,
 		informerFactory.Core().V1().Nodes(),
 		informerFactory.Core().V1().Pods(),
 		informerFactory.Core().V1().PersistentVolumes(),
 		informerFactory.Core().V1().PersistentVolumeClaims(),
 		informerFactory.Core().V1().ReplicationControllers(),
-		informerFactory.Extensions().V1beta1().ReplicaSets(),
-		informerFactory.Apps().V1beta1().StatefulSets(),
+		informerFactory.Apps().V1().ReplicaSets(),
+		informerFactory.Apps().V1().StatefulSets(),
 		informerFactory.Core().V1().Services(),
 		informerFactory.Policy().V1beta1().PodDisruptionBudgets(),
 		informerFactory.Storage().V1().StorageClasses(),
-		v1.DefaultHardPodAffinitySymmetricWeight,
-		utilfeature.DefaultFeatureGate.Enabled(features.EnableEquivalenceClassCache),
-		false,
+		informerFactory.Storage().V1beta1().CSINodes(),
+		recorder,
+		schedulerconfig.SchedulerAlgorithmSource{
+			Provider: &defaultProviderName,
+		},
+		stopCh,
+		schedulerplugins.NewDefaultRegistry(),
+		nil,
+		[]schedulerconfig.PluginConfig{},
 	)
 }

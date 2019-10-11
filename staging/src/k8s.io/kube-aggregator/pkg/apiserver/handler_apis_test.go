@@ -29,9 +29,9 @@ import (
 	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/client-go/tools/cache"
 
-	"k8s.io/kube-aggregator/pkg/apis/apiregistration"
+	apiregistration "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	aggregatorscheme "k8s.io/kube-aggregator/pkg/apiserver/scheme"
-	listers "k8s.io/kube-aggregator/pkg/client/listers/apiregistration/internalversion"
+	listers "k8s.io/kube-aggregator/pkg/client/listers/apiregistration/v1"
 )
 
 func TestAPIs(t *testing.T) {
@@ -231,6 +231,47 @@ func TestAPIs(t *testing.T) {
 						PreferredVersion: metav1.GroupVersionForDiscovery{
 							GroupVersion: "bar/v2",
 							Version:      "v2",
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "unavailable service",
+			apiservices: []*apiregistration.APIService{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "v1.foo"},
+					Spec: apiregistration.APIServiceSpec{
+						Service: &apiregistration.ServiceReference{
+							Namespace: "ns",
+							Name:      "api",
+						},
+						Group:                "foo",
+						Version:              "v1",
+						GroupPriorityMinimum: 11,
+					},
+					Status: apiregistration.APIServiceStatus{
+						Conditions: []apiregistration.APIServiceCondition{
+							{Type: apiregistration.Available, Status: apiregistration.ConditionFalse},
+						},
+					},
+				},
+			},
+			expected: &metav1.APIGroupList{
+				TypeMeta: metav1.TypeMeta{Kind: "APIGroupList", APIVersion: "v1"},
+				Groups: []metav1.APIGroup{
+					discoveryGroup,
+					{
+						Name: "foo",
+						Versions: []metav1.GroupVersionForDiscovery{
+							{
+								GroupVersion: "foo/v1",
+								Version:      "v1",
+							},
+						},
+						PreferredVersion: metav1.GroupVersionForDiscovery{
+							GroupVersion: "foo/v1",
+							Version:      "v1",
 						},
 					},
 				},

@@ -18,11 +18,12 @@ limitations under the License.
 package webhook
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 
 	authorization "k8s.io/api/authorization/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -39,7 +40,11 @@ var (
 	groupVersions = []schema.GroupVersion{authorization.SchemeGroupVersion}
 )
 
-const retryBackoff = 500 * time.Millisecond
+const (
+	retryBackoff = 500 * time.Millisecond
+	// The maximum length of requester-controlled attributes to allow caching.
+	maxControlledAttrCacheSize = 10000
+)
 
 // Ensure Webhook implements the authorizer.Authorizer interface.
 var _ authorizer.Authorizer = (*WebhookAuthorizer)(nil)
@@ -145,7 +150,7 @@ func newWithBackoff(subjectAccessReview authorizationclient.SubjectAccessReviewI
 // TODO(mikedanese): We should eventually support failing closed when we
 // encounter an error. We are failing open now to preserve backwards compatible
 // behavior.
-func (w *WebhookAuthorizer) Authorize(attr authorizer.Attributes) (decision authorizer.Decision, reason string, err error) {
+func (w *WebhookAuthorizer) Authorize(ctx context.Context, attr authorizer.Attributes) (decision authorizer.Decision, reason string, err error) {
 	r := &authorization.SubjectAccessReview{}
 	if user := attr.GetUser(); user != nil {
 		r.Spec = authorization.SubjectAccessReviewSpec{
@@ -183,20 +188,22 @@ func (w *WebhookAuthorizer) Authorize(attr authorizer.Attributes) (decision auth
 			result *authorization.SubjectAccessReview
 			err    error
 		)
-		webhook.WithExponentialBackoff(w.initialBackoff, func() error {
-			result, err = w.subjectAccessReview.Create(r)
+		webhook.WithExponentialBackoff(ctx, w.initialBackoff, func() error {
+			result, err = w.subjectAccessReview.CreateContext(ctx, r)
 			return err
 		})
 		if err != nil {
 			// An error here indicates bad configuration or an outage. Log for debugging.
-			glog.Errorf("Failed to make webhook authorizer request: %v", err)
+			klog.Errorf("Failed to make webhook authorizer request: %v", err)
 			return w.decisionOnError, "", err
 		}
 		r.Status = result.Status
-		if r.Status.Allowed {
-			w.responseCache.Add(string(key), r.Status, w.authorizedTTL)
-		} else {
-			w.responseCache.Add(string(key), r.Status, w.unauthorizedTTL)
+		if shouldCache(attr) {
+			if r.Status.Allowed {
+				w.responseCache.Add(string(key), r.Status, w.authorizedTTL)
+			} else {
+				w.responseCache.Add(string(key), r.Status, w.unauthorizedTTL)
+			}
 		}
 	}
 	switch {
@@ -258,7 +265,25 @@ type subjectAccessReviewClient struct {
 }
 
 func (t *subjectAccessReviewClient) Create(subjectAccessReview *authorization.SubjectAccessReview) (*authorization.SubjectAccessReview, error) {
+	return t.CreateContext(context.Background(), subjectAccessReview)
+}
+
+func (t *subjectAccessReviewClient) CreateContext(ctx context.Context, subjectAccessReview *authorization.SubjectAccessReview) (*authorization.SubjectAccessReview, error) {
 	result := &authorization.SubjectAccessReview{}
-	err := t.w.RestClient.Post().Body(subjectAccessReview).Do().Into(result)
+	err := t.w.RestClient.Post().Context(ctx).Body(subjectAccessReview).Do().Into(result)
 	return result, err
+}
+
+// shouldCache determines whether it is safe to cache the given request attributes. If the
+// requester-controlled attributes are too large, this may be a DoS attempt, so we skip the cache.
+func shouldCache(attr authorizer.Attributes) bool {
+	controlledAttrSize := int64(len(attr.GetNamespace())) +
+		int64(len(attr.GetVerb())) +
+		int64(len(attr.GetAPIGroup())) +
+		int64(len(attr.GetAPIVersion())) +
+		int64(len(attr.GetResource())) +
+		int64(len(attr.GetSubresource())) +
+		int64(len(attr.GetName())) +
+		int64(len(attr.GetPath()))
+	return controlledAttrSize < maxControlledAttrCacheSize
 }

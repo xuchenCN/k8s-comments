@@ -26,7 +26,7 @@ import (
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/api"
-	schedulercache "k8s.io/kubernetes/pkg/scheduler/cache"
+	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
 	"k8s.io/kubernetes/pkg/util/parsers"
 )
 
@@ -108,6 +108,8 @@ func TestImageLocalityPriority(t *testing.T) {
 		},
 	}
 
+	nodeWithNoImages := v1.NodeStatus{}
+
 	tests := []struct {
 		pod          *v1.Pod
 		pods         []*v1.Pod
@@ -160,11 +162,30 @@ func TestImageLocalityPriority(t *testing.T) {
 			expectedList: []schedulerapi.HostPriority{{Host: "machine1", Score: schedulerapi.MaxPriority}, {Host: "machine2", Score: 0}},
 			name:         "if exceed limit, use limit",
 		},
+		{
+			// Pod: gcr.io/2000 gcr.io/10
+
+			// Node1
+			// Image: gcr.io/2000:latest 2000MB
+			// Score: 10 * (2000M/3 - 23M)/(1000M - 23M) = 6
+
+			// Node2
+			// Image: gcr.io/10:latest 10MB
+			// Score: 0 (10M/2 < 23M, min-threshold)
+
+			// Node3
+			// Image:
+			// Score: 0
+			pod:          &v1.Pod{Spec: testMinMax},
+			nodes:        []*v1.Node{makeImageNode("machine1", node403002000), makeImageNode("machine2", node25010), makeImageNode("machine3", nodeWithNoImages)},
+			expectedList: []schedulerapi.HostPriority{{Host: "machine1", Score: 6}, {Host: "machine2", Score: 0}, {Host: "machine3", Score: 0}},
+			name:         "if exceed limit, use limit (with node which has no images present)",
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			nodeNameToInfo := schedulercache.CreateNodeNameToInfoMap(test.pods, test.nodes)
+			nodeNameToInfo := schedulernodeinfo.CreateNodeNameToInfoMap(test.pods, test.nodes)
 			list, err := priorityFunction(ImageLocalityPriorityMap, nil, &priorityMetadata{totalNumNodes: len(test.nodes)})(test.pod, nodeNameToInfo, test.nodes)
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)

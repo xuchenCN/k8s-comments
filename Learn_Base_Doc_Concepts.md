@@ -39,3 +39,119 @@ Headless service : 将ClusterIP 设置为None 让DNS能够解析到pod一层
 隔离网络流量，podSelector来设置哪些pod,policyTypes:Ingress(入口),Egress(出口)
 #### HostAliases
 配置Pod.spec来添加/etc/hosts中的条目
+#### Dry Run
+
+Example
+```
+POST /api/v1/namespaces/test/pods?dryRun=All
+    Content-Type: application/json
+    Accept: application/json
+```
+提交后并不会影响后端存储，用来调试。
+
+#### Server Side Apply 1.16 Beta
+当有多个客户端与组件同时修改Object时会造成冲突，为了解决这个问题1.16提出Server Side Apply
+处理Merge等问题交给服务端；
+提出了一个新的定义 ```Fields Managemenet```，将Field设置权限。
+```
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-cm
+  namespace: default
+  labels:
+    test-label: test
+  managedFields:
+  - manager: kubectl
+    operation: Apply
+    apiVersion: v1
+    fields:
+      f:metadata:
+        f:labels:
+          f:test-label: {}
+  - manager: kube-controller-manager
+    operation: Update
+    apiVersion: v1
+    time: '2019-03-30T16:00:00.000Z'
+    fields:
+      f:data:
+        f:key: {}
+data:
+  key: new value
+```
+
+#### Assigning Pods to Nodes
+##### Affinity, Anti-Affinity
+Pod调度到Node时可以通过 nodeAffinity 来影响调度到的Node
+requiredDuringSchedulingIgnoredDuringExecution,preferredDuringSchedulingIgnoredDuringExecution 选项相对于hard , soft
+
+对于相对于Pod 有 Inter-pod affinity and anti-affinity
+podAffinity 会调度到响应的Pod所在的机器上
+podAntiAffinity 会把Pod调度到某些Pod不在的机器上
+
+##### Taints and Tolerations
+Taints 将Node设置一个状态 例如 ```kubectl taint nodes node1 key=value:NoSchedule```
+影响Scheduler去调度该Node
+Pod可以设置 tolerations 来调度到已经设置 Taint的Node上
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx
+  labels:
+    env: test
+spec:
+  containers:
+  - name: nginx
+    image: nginx
+    imagePullPolicy: IfNotPresent
+  tolerations:
+  - key: "example-key"
+    operator: "Exists"
+    effect: "NoSchedule"
+```
+
+##### CPU Management Policies on the Node
+--cpu-manager-policy kubelet option 控制Node的cpu分配策略
+将所有可用的core - reserved = shared pool
+当有符合分配exclusive的POD到来将从shared pool中将CPU移除，并分配给该POD
+将POD的资源描述进行分类 （ QoS ）
+1. Burstable ：Pod CPU资源描述request和limit不一致
+2. BestEffort ： 没有指定资源描述
+3. Guaranteed ： cpu资源描述 resquest = limit && >= 1 可分配两个exclusive的CPU
+4. Guaranteed ： CPU资源描述并不是整数，所以分在shared pool里
+5. Guaranteed ： 只描述了CPU limit 并且是整数 可分配exclusive的cpu
+
+##### Topology Management Policies on a node
+用来设置资源的Affinity , 对应的device绑定到对应的cpuset上 (NUMA Node affinity)
+必须符合两个条件
+1.--cpu-manager-policy = static
+2.POD QoS is Guaranteed
+分配策略：
+none (default) ：啥都不干
+best-effort ： 将分配对应的cpuset(preferred NUMA )，如果不符合也分配在该node
+restricted ： 将分配对应的cpuset(preferred NUMA )，如果不符合 POD将会 in Terminated state
+single-numa-node 将分配对应的cpuset(single NUMA)，如果不符合 POD将会 in Terminated state
+
+```
+spec:
+  containers:
+  - name: nginx
+    image: nginx
+    resources:
+      limits:
+        memory: "200Mi"
+        cpu: "2"
+        example.com/device: "1"
+      requests:
+        memory: "200Mi"
+        cpu: "2"
+        example.com/device: "1"
+```
+This pod runs in the Guaranteed QoS class because requests are equal to limits.
+
+Topology Manager would consider this Pod. The Topology Manager consults the CPU Manager static policy, which returns the topology of available CPUs. Topology Manager also consults Device Manager to discover the topology of available devices for example.com/device.
+
+Topology Manager will use this information to store the best Topology for this container. In the case of this Pod, CPU and Device Manager will use this stored information at the resource allocation stage.
+
+

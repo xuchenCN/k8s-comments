@@ -24,10 +24,11 @@ import (
 	"strings"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/common"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 )
 
 func addMasterReplica(zone string) error {
@@ -68,12 +69,12 @@ func removeWorkerNodes(zone string) error {
 
 func verifyRCs(c clientset.Interface, ns string, names []string) {
 	for _, name := range names {
-		framework.ExpectNoError(framework.VerifyPods(c, ns, name, true, 1))
+		framework.ExpectNoError(e2epod.VerifyPods(c, ns, name, true, 1))
 	}
 }
 
 func createNewRC(c clientset.Interface, ns string, name string) {
-	_, err := common.NewRCByName(c, ns, name, 1, nil)
+	_, err := common.NewRCByName(c, ns, name, 1, nil, nil)
 	framework.ExpectNoError(err)
 }
 
@@ -118,7 +119,7 @@ var _ = SIGDescribe("HA-master [Feature:HAMaster]", func() {
 	var additionalNodesZones []string
 	var existingRCs []string
 
-	BeforeEach(func() {
+	ginkgo.BeforeEach(func() {
 		framework.SkipUnlessProviderIs("gce")
 		c = f.ClientSet
 		ns = f.Namespace.Name
@@ -127,7 +128,7 @@ var _ = SIGDescribe("HA-master [Feature:HAMaster]", func() {
 		existingRCs = make([]string, 0)
 	})
 
-	AfterEach(func() {
+	ginkgo.AfterEach(func() {
 		// Clean-up additional worker nodes if the test execution was broken.
 		for _, zone := range additionalNodesZones {
 			removeWorkerNodes(zone)
@@ -176,7 +177,7 @@ var _ = SIGDescribe("HA-master [Feature:HAMaster]", func() {
 		verifyRCs(c, ns, existingRCs)
 	}
 
-	It("survive addition/removal replicas same zone [Serial][Disruptive]", func() {
+	ginkgo.It("survive addition/removal replicas same zone [Serial][Disruptive]", func() {
 		zone := framework.TestContext.CloudConfig.Zone
 		step(None, "")
 		numAdditionalReplicas := 2
@@ -188,7 +189,7 @@ var _ = SIGDescribe("HA-master [Feature:HAMaster]", func() {
 		}
 	})
 
-	It("survive addition/removal replicas different zones [Serial][Disruptive]", func() {
+	ginkgo.It("survive addition/removal replicas different zones [Serial][Disruptive]", func() {
 		zone := framework.TestContext.CloudConfig.Zone
 		region := findRegionForZone(zone)
 		zones := findZonesForRegion(region)
@@ -206,7 +207,7 @@ var _ = SIGDescribe("HA-master [Feature:HAMaster]", func() {
 		}
 	})
 
-	It("survive addition/removal replicas multizone workers [Serial][Disruptive]", func() {
+	ginkgo.It("survive addition/removal replicas multizone workers [Serial][Disruptive]", func() {
 		zone := framework.TestContext.CloudConfig.Zone
 		region := findRegionForZone(zone)
 		zones := findZonesForRegion(region)

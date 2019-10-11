@@ -19,6 +19,7 @@ package cacher
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,7 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/storage"
-	"k8s.io/apiserver/pkg/storage/etcd"
+	"k8s.io/apiserver/pkg/storage/etcd3"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -55,11 +56,10 @@ func makeTestPod(name string, resourceVersion uint64) *v1.Pod {
 
 func makeTestStoreElement(pod *v1.Pod) *storeElement {
 	return &storeElement{
-		Key:           "prefix/ns/" + pod.Name,
-		Object:        pod,
-		Labels:        labels.Set(pod.Labels),
-		Fields:        fields.Set{"spec.nodeName": pod.Spec.NodeName},
-		Uninitialized: false,
+		Key:    "prefix/ns/" + pod.Name,
+		Object: pod,
+		Labels: labels.Set(pod.Labels),
+		Fields: fields.Set{"spec.nodeName": pod.Spec.NodeName},
 	}
 }
 
@@ -68,15 +68,16 @@ func newTestWatchCache(capacity int) *watchCache {
 	keyFunc := func(obj runtime.Object) (string, error) {
 		return storage.NamespaceKeyFunc("prefix", obj)
 	}
-	getAttrsFunc := func(obj runtime.Object) (labels.Set, fields.Set, bool, error) {
+	getAttrsFunc := func(obj runtime.Object) (labels.Set, fields.Set, error) {
 		pod, ok := obj.(*v1.Pod)
 		if !ok {
-			return nil, nil, false, fmt.Errorf("not a pod")
+			return nil, nil, fmt.Errorf("not a pod")
 		}
-		return labels.Set(pod.Labels), fields.Set{"spec.nodeName": pod.Spec.NodeName}, false, nil
+		return labels.Set(pod.Labels), fields.Set{"spec.nodeName": pod.Spec.NodeName}, nil
 	}
-	versioner := etcd.APIObjectVersioner{}
-	wc := newWatchCache(capacity, keyFunc, getAttrsFunc, versioner)
+	versioner := etcd3.APIObjectVersioner{}
+	mockHandler := func(*watchCacheEvent) {}
+	wc := newWatchCache(capacity, keyFunc, mockHandler, getAttrsFunc, versioner)
 	wc.clock = clock.NewFakeClock(time.Now())
 	return wc
 }
@@ -275,6 +276,41 @@ func TestEvents(t *testing.T) {
 		if !apiequality.Semantic.DeepEqual(prevPod, result[0].PrevObject) {
 			t.Errorf("unexpected item: %v, expected: %v", result[0].PrevObject, prevPod)
 		}
+	}
+}
+
+func TestMarker(t *testing.T) {
+	store := newTestWatchCache(3)
+
+	// First thing that is called when propagated from storage is Replace.
+	store.Replace([]interface{}{
+		makeTestPod("pod1", 5),
+		makeTestPod("pod2", 9),
+	}, "9")
+
+	_, err := store.GetAllEventsSince(8)
+	if err == nil || !strings.Contains(err.Error(), "too old resource version") {
+		t.Errorf("unexpected error: %v", err)
+	}
+	// Getting events from 8 should return no events,
+	// even though there is a marker there.
+	result, err := store.GetAllEventsSince(9)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result) != 0 {
+		t.Errorf("unexpected result: %#v, expected no events", result)
+	}
+
+	pod := makeTestPod("pods", 12)
+	store.Add(pod)
+	// Getting events from 8 should still work and return one event.
+	result, err = store.GetAllEventsSince(9)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result) != 1 || !apiequality.Semantic.DeepEqual(result[0].Object, pod) {
+		t.Errorf("unexpected result: %#v, expected %v", result, pod)
 	}
 }
 

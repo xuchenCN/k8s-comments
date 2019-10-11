@@ -49,7 +49,7 @@ type priorityFunc func(pod *v1.Pod, nodes *v1.NodeList) (*schedulerapi.HostPrior
 
 type priorityConfig struct {
 	function priorityFunc
-	weight   int
+	weight   int64
 }
 
 type Extender struct {
@@ -75,7 +75,6 @@ func (e *Extender) serveHTTP(t *testing.T, w http.ResponseWriter, req *http.Requ
 		}
 
 		if strings.Contains(req.URL.Path, filter) {
-			resp := &schedulerapi.ExtenderFilterResult{}
 			resp, err := e.Filter(&args)
 			if err != nil {
 				resp.Error = err.Error()
@@ -156,42 +155,42 @@ func (e *Extender) Filter(args *schedulerapi.ExtenderArgs) (*schedulerapi.Extend
 
 	if e.nodeCacheCapable {
 		return e.filterUsingNodeCache(args)
-	} else {
-		for _, node := range args.Nodes.Items {
-			fits := true
-			for _, predicate := range e.predicates {
-				fit, err := predicate(args.Pod, &node)
-				if err != nil {
-					return &schedulerapi.ExtenderFilterResult{
-						Nodes:       &v1.NodeList{},
-						NodeNames:   nil,
-						FailedNodes: schedulerapi.FailedNodesMap{},
-						Error:       err.Error(),
-					}, err
-				}
-				if !fit {
-					fits = false
-					break
-				}
+	}
+
+	for _, node := range args.Nodes.Items {
+		fits := true
+		for _, predicate := range e.predicates {
+			fit, err := predicate(args.Pod, &node)
+			if err != nil {
+				return &schedulerapi.ExtenderFilterResult{
+					Nodes:       &v1.NodeList{},
+					NodeNames:   nil,
+					FailedNodes: schedulerapi.FailedNodesMap{},
+					Error:       err.Error(),
+				}, err
 			}
-			if fits {
-				filtered = append(filtered, node)
-			} else {
-				failedNodesMap[node.Name] = fmt.Sprintf("extender failed: %s", e.name)
+			if !fit {
+				fits = false
+				break
 			}
 		}
-
-		return &schedulerapi.ExtenderFilterResult{
-			Nodes:       &v1.NodeList{Items: filtered},
-			NodeNames:   nil,
-			FailedNodes: failedNodesMap,
-		}, nil
+		if fits {
+			filtered = append(filtered, node)
+		} else {
+			failedNodesMap[node.Name] = fmt.Sprintf("extender failed: %s", e.name)
+		}
 	}
+
+	return &schedulerapi.ExtenderFilterResult{
+		Nodes:       &v1.NodeList{Items: filtered},
+		NodeNames:   nil,
+		FailedNodes: failedNodesMap,
+	}, nil
 }
 
 func (e *Extender) Prioritize(args *schedulerapi.ExtenderArgs) (*schedulerapi.HostPriorityList, error) {
 	result := schedulerapi.HostPriorityList{}
-	combinedScores := map[string]int{}
+	combinedScores := map[string]int64{}
 	var nodes = &v1.NodeList{Items: []v1.Node{}}
 
 	if e.nodeCacheCapable {
@@ -234,21 +233,21 @@ func (e *Extender) Bind(binding *schedulerapi.ExtenderBindingArgs) error {
 	return e.Client.CoreV1().Pods(b.Namespace).Bind(b)
 }
 
-func machine_1_2_3_Predicate(pod *v1.Pod, node *v1.Node) (bool, error) {
+func machine1_2_3Predicate(pod *v1.Pod, node *v1.Node) (bool, error) {
 	if node.Name == "machine1" || node.Name == "machine2" || node.Name == "machine3" {
 		return true, nil
 	}
 	return false, nil
 }
 
-func machine_2_3_5_Predicate(pod *v1.Pod, node *v1.Node) (bool, error) {
+func machine2_3_5Predicate(pod *v1.Pod, node *v1.Node) (bool, error) {
 	if node.Name == "machine2" || node.Name == "machine3" || node.Name == "machine5" {
 		return true, nil
 	}
 	return false, nil
 }
 
-func machine_2_Prioritizer(pod *v1.Pod, nodes *v1.NodeList) (*schedulerapi.HostPriorityList, error) {
+func machine2Prioritizer(pod *v1.Pod, nodes *v1.NodeList) (*schedulerapi.HostPriorityList, error) {
 	result := schedulerapi.HostPriorityList{}
 	for _, node := range nodes.Items {
 		score := 1
@@ -257,13 +256,13 @@ func machine_2_Prioritizer(pod *v1.Pod, nodes *v1.NodeList) (*schedulerapi.HostP
 		}
 		result = append(result, schedulerapi.HostPriority{
 			Host:  node.Name,
-			Score: score,
+			Score: int64(score),
 		})
 	}
 	return &result, nil
 }
 
-func machine_3_Prioritizer(pod *v1.Pod, nodes *v1.NodeList) (*schedulerapi.HostPriorityList, error) {
+func machine3Prioritizer(pod *v1.Pod, nodes *v1.NodeList) (*schedulerapi.HostPriorityList, error) {
 	result := schedulerapi.HostPriorityList{}
 	for _, node := range nodes.Items {
 		score := 1
@@ -272,7 +271,7 @@ func machine_3_Prioritizer(pod *v1.Pod, nodes *v1.NodeList) (*schedulerapi.HostP
 		}
 		result = append(result, schedulerapi.HostPriority{
 			Host:  node.Name,
-			Score: score,
+			Score: int64(score),
 		})
 	}
 	return &result, nil
@@ -284,8 +283,8 @@ func TestSchedulerExtender(t *testing.T) {
 
 	extender1 := &Extender{
 		name:         "extender1",
-		predicates:   []fitPredicate{machine_1_2_3_Predicate},
-		prioritizers: []priorityConfig{{machine_2_Prioritizer, 1}},
+		predicates:   []fitPredicate{machine1_2_3Predicate},
+		prioritizers: []priorityConfig{{machine2Prioritizer, 1}},
 	}
 	es1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		extender1.serveHTTP(t, w, req)
@@ -294,8 +293,8 @@ func TestSchedulerExtender(t *testing.T) {
 
 	extender2 := &Extender{
 		name:         "extender2",
-		predicates:   []fitPredicate{machine_2_3_5_Predicate},
-		prioritizers: []priorityConfig{{machine_3_Prioritizer, 1}},
+		predicates:   []fitPredicate{machine2_3_5Predicate},
+		prioritizers: []priorityConfig{{machine3Prioritizer, 1}},
 		Client:       clientSet,
 	}
 	es2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -305,8 +304,8 @@ func TestSchedulerExtender(t *testing.T) {
 
 	extender3 := &Extender{
 		name:             "extender3",
-		predicates:       []fitPredicate{machine_1_2_3_Predicate},
-		prioritizers:     []priorityConfig{{machine_2_Prioritizer, 5}},
+		predicates:       []fitPredicate{machine1_2_3Predicate},
+		prioritizers:     []priorityConfig{{machine2Prioritizer, 5}},
 		nodeCacheCapable: true,
 	}
 	es3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -349,7 +348,7 @@ func TestSchedulerExtender(t *testing.T) {
 	}
 	policy.APIVersion = "v1"
 
-	context = initTestScheduler(t, context, nil, false, &policy)
+	context = initTestScheduler(t, context, false, &policy)
 	defer cleanupTest(t, context)
 
 	DoTestPodScheduling(context.ns, t, clientSet)
