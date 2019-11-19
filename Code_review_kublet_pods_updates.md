@@ -771,13 +771,13 @@ func (s *sourceFile) replaceStore(pods ...*v1.Pod) (err error) {
 
 ``` 
 func (u *UndeltaStore) Replace(list []interface{}, resourceVersion string) error {
-	//更新Store,这里因该是TheadSafeStore具体看上边定义
+	//更新Store,这里因该是ThreadSafeStore具体看上边定义
 	if err := u.Store.Replace(list, resourceVersion); err != nil {
 		return err
 	}
 	//将pods推送到updates
 	u.PushFunc(u.Store.List())
-	return nil
+	return nilr
 }
 ```
 

@@ -155,3 +155,100 @@ Topology Manager would consider this Pod. The Topology Manager consults the CPU 
 Topology Manager will use this information to store the best Topology for this container. In the case of this Pod, CPU and Device Manager will use this stored information at the resource allocation stage.
 
 
+#### Secrets
+可以将一些敏感数据加密后(base64加密)存放，给Pod,或者作为kubelet拉取镜像的账号密码
+pod使用可以挂载文件，或者使用环境变量
+
+创建secret
+```
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysecret
+type: Opaque
+data:
+  username: YWRtaW4=
+stringData:
+  username: administrator
+```
+
+data 为加密的，stringData为明文的
+
+pod作为volume使用
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mypod
+spec:
+  containers:
+  - name: mypod
+    image: redis
+    volumeMounts:
+    - name: foo
+      mountPath: "/etc/foo"
+      readOnly: true
+  volumes:
+  - name: foo
+    secret:
+      secretName: mysecret
+```
+
+将路径对应不同文件
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mypod
+spec:
+  containers:
+  - name: mypod
+    image: redis
+    volumeMounts:
+    - name: foo
+      mountPath: "/etc/foo"
+  volumes:
+  - name: foo
+    secret:
+      secretName: mysecret
+      items:
+      - key: username
+        path: my-group/my-username
+        mode: 511
+```
+
+作为环境变量
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secret-env-pod
+spec:
+  containers:
+  - name: mycontainer
+    image: redis
+    env:
+      - name: SECRET_USERNAME
+        valueFrom:
+          secretKeyRef:
+            name: mysecret
+            key: username
+      - name: SECRET_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: mysecret
+            key: password
+  restartPolicy: Never
+```
+
+使用限制：
+secret volume必须要创建在使用secret的Pod之前
+文件不能超过1M
+kubelet只能为apiserver过来的pod挂载secret
+secret作为环境变量必须要在Pod之前启动，除非设置成optional否则pod无法启动
+以```secretKeyRef```作为引用的secret不存在则无法启动pod
+作为环境变量时通过```envFrom```,如果有不合法的key会允许Pod启动，会记录event
+
+启动的pod如果引用的secret不存在则会等待secret存在后才会启动
