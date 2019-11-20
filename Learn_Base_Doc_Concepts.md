@@ -7,7 +7,7 @@
 ### Pod
 #### Pod Preset
 预先设置一些Pod的属性，有Pod创建的时候通过selector来决定填充到哪些Pod上。
-#### Pod Topology Spread Constraints
+#### Pod Topology Spread Constraints since 1.16
 为Node设置一些Label划分区域并标示机器，这样使用topologySpreadConstraints特性可以
 将Pod均匀的分布在不同的区域，也可以设置skew来决定分布的Pod均匀程度，当不满足条件时也可以设置 DoNotSchedule/ScheduleAnyway 
 来设置调度逻辑
@@ -252,3 +252,10 @@ secret作为环境变量必须要在Pod之前启动，除非设置成optional否
 作为环境变量时通过```envFrom```,如果有不合法的key会允许Pod启动，会记录event
 
 启动的pod如果引用的secret不存在则会等待secret存在后才会启动
+
+
+### Scheduler framework since 1.15
+由于当前core scheduler越来越复杂，导致了诸多问题，而且扩展调度器实现自己的业务逻辑变得更加复杂
+该功能能让扩展代码与core scheduler一起编译生成二进制而且不需要修改代码只是扩展
+[design doc](https://github.com/kubernetes/enhancements/blob/master/keps/sig-scheduling/20180409-scheduling-framework.md)
+Use case [kube-batch](https://github.com/kubernetes-sigs/kube-batch)
