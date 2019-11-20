@@ -154,6 +154,7 @@ Topology Manager would consider this Pod. The Topology Manager consults the CPU 
 
 Topology Manager will use this information to store the best Topology for this container. In the case of this Pod, CPU and Device Manager will use this stored information at the resource allocation stage.
 
+### Configuration
 
 #### Secrets
 可以将一些敏感数据加密后(base64加密)存放，给Pod,或者作为kubelet拉取镜像的账号密码
@@ -254,7 +255,7 @@ secret作为环境变量必须要在Pod之前启动，除非设置成optional否
 启动的pod如果引用的secret不存在则会等待secret存在后才会启动
 
 
-### Scheduler framework since 1.15
+#### Scheduler framework since 1.15
 由于当前core scheduler越来越复杂，导致了诸多问题，而且扩展调度器实现自己的业务逻辑变得更加复杂
 该功能能让扩展代码与core scheduler一起编译生成二进制而且不需要修改代码只是扩展
 [design doc](https://github.com/kubernetes/enhancements/blob/master/keps/sig-scheduling/20180409-scheduling-framework.md)
