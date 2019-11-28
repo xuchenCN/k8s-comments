@@ -185,5 +185,119 @@ cfg := &Config{
 	c.nodeLister = nodeInformer.Lister()
 ```
 
+回头继续看createScheduler()
+完成了这个configurator的创建
+
+构建一个schedulerConfigurator对象
+
+```
+// Rebuild the configurator with a default Create(...) method.
+	configurator = &schedulerConfigurator{
+		configurator,
+		s.PolicyConfigFile,
+		s.AlgorithmProvider}
+```
+
+正式构建scheduler
+
+```
+scheduler.NewFromConfigurator(configurator, func(cfg *scheduler.Config) {
+		cfg.Recorder = recorder
+	})
+```
+
+创建
+
+```
+
+// NewFromConfigurator returns a new scheduler that is created entirely by the Configurator.  Assumes Create() is implemented.
+// Supports intermediate Config mutation for now if you provide modifier functions which will run after Config is created.
+func NewFromConfigurator(c Configurator, modifiers ...func(c *Config)) (*Scheduler, error) {
+	cfg, err := c.Create()
+	if err != nil {
+		return nil, err
+	}
+	// Mutate it if any functions were provided, changes might be required for certain types of tests (i.e. change the recorder).
+	for _, modifier := range modifiers {
+		modifier(cfg)
+	}
+	// From this point on the config is immutable to the outside.
+	s := &Scheduler{
+		config: cfg,
+	}
+	metrics.Register()
+	return s, nil
+}
+```
+
+c.Create()
+
+```
+if _, err := os.Stat(sc.policyFile); err != nil {
+		if sc.Configurator != nil {
+			return sc.Configurator.CreateFromProvider(sc.algorithmProvider)
+		}
+		return nil, fmt.Errorf("Configurator was nil")
+	}
+```
+
+默认启动会调用```sc.Configurator.CreateFromProvider(sc.algorithmProvider)```
+
+这个sc.algorithmProvider要回头看看main()里边的```NewSchedulerServer()```
+
+```
+// NewSchedulerServer creates a new SchedulerServer with default parameters
+func NewSchedulerServer() *SchedulerServer {
+	versioned := &v1alpha1.KubeSchedulerConfiguration{}
+	api.Scheme.Default(versioned) //这里会设置default值
+	....
+}
+```
+
+每个API包里的schema都会有SchemaBuilder 例如
+
+```
+var (
+	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes, addDefaultingFuncs)
+	AddToScheme   = SchemeBuilder.AddToScheme
+)
+```
+
+这个```addDefaultingFuncs``` 会设置一些默认属性
+k8s.io/kubernetes/pkg/apis/componentconfig/v1alpha1/defaults.go 这个文件里设置了```KubeSchedulerConfiguration```
+
+```
+func SetDefaults_KubeSchedulerConfiguration(obj *KubeSchedulerConfiguration) {
+	if obj.Port == 0 {
+		obj.Port = ports.SchedulerPort
+	}
+	if obj.Address == "" {
+		obj.Address = "0.0.0.0"
+	}
+	if obj.AlgorithmProvider == "" {
+		obj.AlgorithmProvider = "DefaultProvider"
+	}
+	if obj.ContentType == "" {
+		obj.ContentType = "application/vnd.kubernetes.protobuf"
+	}
+	if obj.KubeAPIQPS == 0 {
+		obj.KubeAPIQPS = 50.0
+	}
+	if obj.KubeAPIBurst == 0 {
+		obj.KubeAPIBurst = 100
+	}
+	if obj.SchedulerName == "" {
+		obj.SchedulerName = api.DefaultSchedulerName
+	}
+	if obj.HardPodAffinitySymmetricWeight == 0 {
+		obj.HardPodAffinitySymmetricWeight = api.DefaultHardPodAffinitySymmetricWeight
+	}
+	if obj.FailureDomains == "" {
+		obj.FailureDomains = api.DefaultFailureDomains
+	}
+}
+```
+
+所以加载的应该是 ```DefaultProvider```
 
 
