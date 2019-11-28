@@ -300,4 +300,24 @@ func SetDefaults_KubeSchedulerConfiguration(obj *KubeSchedulerConfiguration) {
 
 所以加载的应该是 ```DefaultProvider```
 
+随后加载这个provider
+
+```
+// GetAlgorithmProvider should not be used to modify providers. It is publicly visible for testing.
+func GetAlgorithmProvider(name string) (*AlgorithmProviderConfig, error) {
+	schedulerFactoryMutex.Lock()
+	defer schedulerFactoryMutex.Unlock()
+
+	provider, ok := algorithmProviderMap[name]
+	if !ok {
+		return nil, fmt.Errorf("plugin %q has not been registered", name)
+	}
+
+	return &provider, nil
+}
+```
+
+这里寻找```algorithmProviderMap["DefaultProvider"]``` 
+
+回头看 k8s.io/kubernetes/plugin/pkg/scheduler/algorithmprovider/defaults/defaults.go这里的init()方法
 
