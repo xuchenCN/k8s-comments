@@ -321,3 +321,17 @@ func GetAlgorithmProvider(name string) (*AlgorithmProviderConfig, error) {
 
 回头看 k8s.io/kubernetes/plugin/pkg/scheduler/algorithmprovider/defaults/defaults.go这里的init()方法
 
+首先注册 metadata
+
+```
+// Register functions that extract metadata used by predicates and priorities computations.
+	factory.RegisterPredicateMetadataProducerFactory(
+		func(args factory.PluginFactoryArgs) algorithm.MetadataProducer {
+			return predicates.NewPredicateMetadataFactory(args.PodLister)
+		})
+	factory.RegisterPriorityMetadataProducerFactory(
+		func(args factory.PluginFactoryArgs) algorithm.MetadataProducer {
+			return priorities.PriorityMetadata
+		})
+```
+
