@@ -335,3 +335,40 @@ func GetAlgorithmProvider(name string) (*AlgorithmProviderConfig, error) {
 		})
 ```
 
+```
+
+// GetMetadata returns the predicateMetadata used which will be used by various predicates.
+func (pfactory *PredicateMetadataFactory) GetMetadata(pod *v1.Pod, nodeNameToInfoMap map[string]*schedulercache.NodeInfo) interface{} {
+	// If we cannot compute metadata, just return nil
+	if pod == nil {
+		return nil
+	}
+	matchingTerms, err := getMatchingAntiAffinityTerms(pod, nodeNameToInfoMap) //获得AntiAffinity的Node与Term的列表 
+	if err != nil {
+		return nil
+	}
+	predicateMetadata := &predicateMetadata{
+		pod:                       pod,
+		podBestEffort:             isPodBestEffort(pod),
+		podRequest:                GetResourceRequest(pod),
+		podPorts:                  GetUsedPorts(pod),
+		matchingAntiAffinityTerms: matchingTerms,
+	}
+	//这里的predicatePrecomputations,如果没有自定义应该是没有的
+	for predicateName, precomputeFunc := range predicatePrecomputations { 
+		glog.V(10).Info("Precompute: %v", predicateName)
+		precomputeFunc(predicateMetadata)
+	}
+	return predicateMetadata
+}
+
+```
+
+所以就是这个predicateMeatadata就是这些关键数据
+```
+pod:                       pod,
+podBestEffort:             isPodBestEffort(pod),
+podRequest:                GetResourceRequest(pod),
+podPorts:                  GetUsedPorts(pod),
+matchingAntiAffinityTerms: matchingTerms,
+```
