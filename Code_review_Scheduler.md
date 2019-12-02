@@ -974,3 +974,30 @@ func startHTTP(s *options.SchedulerServer) {
 	panic("unreachable")
 ```
 
+执行 scheduler
+
+```
+// Run begins watching and scheduling. It starts a goroutine and returns immediately.
+func (s *Scheduler) Run() {
+	go wait.Until(s.scheduleOne, 0, s.config.StopEverything)
+}
+```
+
+func (s *Scheduler) scheduleOne() 正式开始调度pod
+
+```
+// 从FIFO队列中获得一个未分配且未关闭的Pod
+pod := s.config.NextPod()
+
+// 如果这个Pod已经标记为删除状态则不会进行调度
+if pod.DeletionTimestamp != nil {
+		s.config.Recorder.Eventf(pod, v1.EventTypeWarning, "FailedScheduling", "skip schedule deleting pod: %v/%v", pod.Namespace, pod.Name)
+		glog.V(3).Infof("Skip schedule deleting pod: %v/%v", pod.Namespace, pod.Name)
+		return
+	}
+	
+// 开始调度
+dest, err := s.config.Algorithm.Schedule(pod, s.config.NodeLister)
+```
+
+
