@@ -637,3 +637,41 @@ TaintTolerationPriority
 	// Fit is determined by node selector query.
 	factory.RegisterFitPredicate("MatchNodeSelector", predicates.PodSelectorMatches)
 ```
+
+这个暂时不知道用来做什么，只是获得了一个Pod里边包含另一个Pod的Controller
+
+```
+// Use equivalence class to speed up predicates & priorities
+	factory.RegisterGetEquivalencePodFunction(GetEquivalencePod)
+```
+
+还有一些Priority的算法
+
+```
+// ServiceSpreadingPriority is a priority config factory that spreads pods by minimizing
+	// the number of pods (belonging to the same service) on the same node.
+	// Register the factory so that it's available, but do not include it as part of the default priorities
+	// Largely replaced by "SelectorSpreadPriority", but registered for backward compatibility with 1.0
+	factory.RegisterPriorityConfigFactory(
+		"ServiceSpreadingPriority",
+		factory.PriorityConfigFactory{
+			Function: func(args factory.PluginFactoryArgs) algorithm.PriorityFunction {
+				return priorities.NewSelectorSpreadPriority(args.ServiceLister, algorithm.EmptyControllerLister{}, algorithm.EmptyReplicaSetLister{}, algorithm.EmptyStatefulSetLister{})
+			},
+			Weight: 1,
+		},
+	)
+
+	// EqualPriority is a prioritizer function that gives an equal weight of one to all nodes
+	// Register the priority function so that its available
+	// but do not include it as part of the default priorities
+	factory.RegisterPriorityFunction2("EqualPriority", core.EqualPriorityMap, nil, 1)
+	// ImageLocalityPriority prioritizes nodes based on locality of images requested by a pod. Nodes with larger size
+	// of already-installed packages required by the pod will be preferred over nodes with no already-installed
+	// packages required by the pod or a small total size of already-installed packages required by the pod.
+	factory.RegisterPriorityFunction2("ImageLocalityPriority", priorities.ImageLocalityPriorityMap, nil, 1)
+	// Optional, cluster-autoscaler friendly priority function - give used nodes higher priority.
+	factory.RegisterPriorityFunction2("MostRequestedPriority", priorities.MostRequestedPriorityMap, nil, 1)
+```
+
+至此貌似所有的算法都注册完成了
