@@ -872,3 +872,105 @@ func Register() {
 }
 ```
 
+scheduler 初始化完成
+
+```
+sched, err := createScheduler(
+		s,
+		kubecli,
+		informerFactory.Core().V1().Nodes(),
+		informerFactory.Core().V1().PersistentVolumes(),
+		informerFactory.Core().V1().PersistentVolumeClaims(),
+		informerFactory.Core().V1().ReplicationControllers(),
+		informerFactory.Extensions().V1beta1().ReplicaSets(),
+		informerFactory.Apps().V1beta1().StatefulSets(),
+		informerFactory.Core().V1().Services(),
+		recorder,
+	)
+```
+
+随后是启动Http的一些服务
+
+```
+func startHTTP(s *options.SchedulerServer) {
+	mux := http.NewServeMux()
+	healthz.InstallHandler(mux)
+	if s.EnableProfiling {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		if s.EnableContentionProfiling {
+			goruntime.SetBlockProfileRate(1)
+		}
+	}
+	if c, err := configz.New("componentconfig"); err == nil {
+		c.Set(s.KubeSchedulerConfiguration)
+	} else {
+		glog.Errorf("unable to register configz: %s", err)
+	}
+	configz.InstallHandler(mux)
+	mux.Handle("/metrics", prometheus.Handler())
+
+	server := &http.Server{
+		Addr:    net.JoinHostPort(s.Address, strconv.Itoa(int(s.Port))),
+		Handler: mux,
+	}
+	glog.Fatal(server.ListenAndServe())
+}
+```
+
+随后是启动和选举动作
+
+```
+	stop := make(chan struct{})
+	defer close(stop)
+	// 启动informer
+	informerFactory.Start(stop)
+	// 定义了 run 方法后续会运行scheduler.run
+	run := func(_ <-chan struct{}) {
+		sched.Run()
+		select {}
+	}
+	// 如果没开启选举，直接运行
+	if !s.LeaderElection.LeaderElect {
+		run(nil)
+		panic("unreachable")
+	}
+	// 获得hostname用于选举
+	id, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("unable to get hostname: %v", err)
+	}
+	
+	// 创建了一个 EndpointLock
+	// TODO: enable other lock types
+	rl := &resourcelock.EndpointsLock{
+		EndpointsMeta: metav1.ObjectMeta{
+			Namespace: "kube-system",
+			Name:      "kube-scheduler",
+		},
+		Client: kubecli,
+		LockConfig: resourcelock.ResourceLockConfig{
+			Identity:      id,
+			EventRecorder: recorder,
+		},
+	}
+	
+	// 开始选举
+	leaderelection.RunOrDie(leaderelection.LeaderElectionConfig{
+		Lock:          rl,
+		LeaseDuration: s.LeaderElection.LeaseDuration.Duration,
+		RenewDeadline: s.LeaderElection.RenewDeadline.Duration,
+		RetryPeriod:   s.LeaderElection.RetryPeriod.Duration,
+		Callbacks: leaderelection.LeaderCallbacks{
+			OnStartedLeading: run,
+			OnStoppedLeading: func() {
+				glog.Fatalf("lost master")
+			},
+		},
+	})
+
+	panic("unreachable")
+```
+
