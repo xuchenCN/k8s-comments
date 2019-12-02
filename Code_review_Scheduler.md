@@ -1087,5 +1087,153 @@ var filtered []*v1.Node
 	return filtered, failedPredicateMap, nil
 ```
 
-至此完成了 predicate 操作，过滤掉了pod不能放置的Node
+至此完成了 predicate 操作，过滤掉了pod不能放置的Node,随后看看priority的动作
 
+```
+// 先构建 Metadata
+metaPrioritiesInterface := g.priorityMetaProducer(pod, g.cachedNodeInfoMap)
+// 开始打分
+priorityList, err := PrioritizeNodes(pod, g.cachedNodeInfoMap, metaPrioritiesInterface, g.prioritizers, filteredNodes, g.extenders)
+```
+
+查看具体过程
+
+```
+// Prioritizes the nodes by running the individual priority functions in parallel.
+// Each priority function is expected to set a score of 0-10
+// 0 is the lowest priority score (least preferred node) and 10 is the highest
+// Each priority function can also have its own weight
+// The node scores returned by the priority function are multiplied by the weights to get weighted scores
+// All scores are finally combined (added) to get the total weighted scores of all nodes
+func PrioritizeNodes(
+	pod *v1.Pod,
+	nodeNameToInfo map[string]*schedulercache.NodeInfo,
+	meta interface{},
+	priorityConfigs []algorithm.PriorityConfig,
+	nodes []*v1.Node,
+	extenders []algorithm.SchedulerExtender,
+) (schedulerapi.HostPriorityList, error) {
+	// If no priority configs are provided, then the EqualPriority function is applied
+	// This is required to generate the priority list in the required format
+	
+	// 
+	if len(priorityConfigs) == 0 && len(extenders) == 0 {
+		result := make(schedulerapi.HostPriorityList, 0, len(nodes))
+		for i := range nodes {
+			hostPriority, err := EqualPriorityMap(pod, meta, nodeNameToInfo[nodes[i].Name])
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, hostPriority)
+		}
+		return result, nil
+	}
+
+	var (
+		mu   = sync.Mutex{}
+		wg   = sync.WaitGroup{}
+		errs []error
+	)
+	appendError := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		errs = append(errs, err)
+	}
+
+	results := make([]schedulerapi.HostPriorityList, 0, len(priorityConfigs))
+	for range priorityConfigs {
+		results = append(results, nil)
+	}
+	for i, priorityConfig := range priorityConfigs {
+		if priorityConfig.Function != nil {
+			// DEPRECATED
+			wg.Add(1)
+			go func(index int, config algorithm.PriorityConfig) {
+				defer wg.Done()
+				var err error
+				results[index], err = config.Function(pod, nodeNameToInfo, nodes)
+				if err != nil {
+					appendError(err)
+				}
+			}(i, priorityConfig)
+		} else {
+			results[i] = make(schedulerapi.HostPriorityList, len(nodes))
+		}
+	}
+	processNode := func(index int) {
+		nodeInfo := nodeNameToInfo[nodes[index].Name]
+		var err error
+		for i := range priorityConfigs {
+			if priorityConfigs[i].Function != nil {
+				continue
+			}
+			results[i][index], err = priorityConfigs[i].Map(pod, meta, nodeInfo)
+			if err != nil {
+				appendError(err)
+				return
+			}
+		}
+	}
+	workqueue.Parallelize(16, len(nodes), processNode)
+	for i, priorityConfig := range priorityConfigs {
+		if priorityConfig.Reduce == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(index int, config algorithm.PriorityConfig) {
+			defer wg.Done()
+			if err := config.Reduce(pod, meta, nodeNameToInfo, results[index]); err != nil {
+				appendError(err)
+			}
+		}(i, priorityConfig)
+	}
+	// Wait for all computations to be finished.
+	wg.Wait()
+	if len(errs) != 0 {
+		return schedulerapi.HostPriorityList{}, errors.NewAggregate(errs)
+	}
+
+	// Summarize all scores.
+	result := make(schedulerapi.HostPriorityList, 0, len(nodes))
+	// TODO: Consider parallelizing it.
+	for i := range nodes {
+		result = append(result, schedulerapi.HostPriority{Host: nodes[i].Name, Score: 0})
+		for j := range priorityConfigs {
+			result[i].Score += results[j][i].Score * priorityConfigs[j].Weight
+		}
+	}
+
+	if len(extenders) != 0 && nodes != nil {
+		combinedScores := make(map[string]int, len(nodeNameToInfo))
+		for _, extender := range extenders {
+			wg.Add(1)
+			go func(ext algorithm.SchedulerExtender) {
+				defer wg.Done()
+				prioritizedList, weight, err := ext.Prioritize(pod, nodes)
+				if err != nil {
+					// Prioritization errors from extender can be ignored, let k8s/other extenders determine the priorities
+					return
+				}
+				mu.Lock()
+				for i := range *prioritizedList {
+					host, score := (*prioritizedList)[i].Host, (*prioritizedList)[i].Score
+					combinedScores[host] += score * weight
+				}
+				mu.Unlock()
+			}(extender)
+		}
+		// wait for all go routines to finish
+		wg.Wait()
+		for i := range result {
+			result[i].Score += combinedScores[result[i].Host]
+		}
+	}
+
+	if glog.V(10) {
+		for i := range result {
+			glog.V(10).Infof("Host %s => Score %d", result[i].Host, result[i].Score)
+		}
+	}
+	return result, nil
+}
+```
