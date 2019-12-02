@@ -1163,15 +1163,16 @@ func PrioritizeNodes(
 			results[i] = make(schedulerapi.HostPriorityList, len(nodes))
 		}
 	}
-	// 这个
-	
+	// 这个就是Map方法了
 	processNode := func(index int) {
 		nodeInfo := nodeNameToInfo[nodes[index].Name]
 		var err error
 		for i := range priorityConfigs {
+                        // 如果有Function说明用的是老的方案，则跳过
 			if priorityConfigs[i].Function != nil {
 				continue
 			}
+                        // 调用priorityConfigs.Map方法
 			results[i][index], err = priorityConfigs[i].Map(pod, meta, nodeInfo)
 			if err != nil {
 				appendError(err)
@@ -1179,11 +1180,15 @@ func PrioritizeNodes(
 			}
 		}
 	}
+	// 并行处理 Map
 	workqueue.Parallelize(16, len(nodes), processNode)
+	
+	// 开始进行Reducle
 	for i, priorityConfig := range priorityConfigs {
 		if priorityConfig.Reduce == nil {
 			continue
 		}
+		// 这里用的wg是雨Function为同一个，因为要做到串行处理
 		wg.Add(1)
 		go func(index int, config algorithm.PriorityConfig) {
 			defer wg.Done()
