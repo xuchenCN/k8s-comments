@@ -502,7 +502,7 @@ func RegisterFitPredicateFactory(name string, predicateFactory FitPredicateFacto
 }
 ```
 
-其中两个关键的struct是 
+其中两个关键的参数是 
 
 ```
 // PluginFactoryArgs are passed to all plugin factory functions.
@@ -525,5 +525,86 @@ type PluginFactoryArgs struct {
 type FitPredicate func(pod *v1.Pod, meta interface{}, nodeInfo *schedulercache.NodeInfo) (bool, []PredicateFailureReason, error)
 
 ```
+
+所以 defaultPredicates 是返回了一个Sets 里边有注册好的 FitPredicateFactory，对应了
+
+```
+NoVolumeZoneConflict
+MaxEBSVolumeCount
+MaxGCEPDVolumeCount
+MatchInterPodAffinity
+NoDiskConflict
+GeneralPredicates
+PodToleratesNodeTaints
+CheckNodeMemoryPressure
+CheckNodeDiskPressure
+```
+
+再看看 defaultPriorities()
+
+```
+// spreads pods by minimizing the number of pods (belonging to the same service or replication controller) on the same node.
+		factory.RegisterPriorityConfigFactory(
+			"SelectorSpreadPriority",
+			factory.PriorityConfigFactory{
+				Function: func(args factory.PluginFactoryArgs) algorithm.PriorityFunction {
+					return priorities.NewSelectorSpreadPriority(args.ServiceLister, args.ControllerLister, args.ReplicaSetLister, args.StatefulSetLister)
+				},
+				Weight: 1,
+			},
+		),
+```
+
+Priority目前已经转向Map-Reduce的打分方式了
+
+```
+// DEPRECATED
+// Use Map-Reduce pattern for priority functions.
+// A PriorityFunctionFactory produces a PriorityConfig from the given args.
+// 这个是之前老的函数，传入一个pod,nodes进行打分
+type PriorityFunctionFactory func(PluginFactoryArgs) algorithm.PriorityFunction
+
+// A PriorityFunctionFactory produces map & reduce priority functions
+// from a given args.
+// FIXME: Rename to PriorityFunctionFactory.
+// 这个是新的方法用MapFunction 和 ReduceFunction来打分提高性能也更可控
+type PriorityFunctionFactory2 func(PluginFactoryArgs) (algorithm.PriorityMapFunction, algorithm.PriorityReduceFunction)
+
+// A PriorityConfigFactory produces a PriorityConfig from the given function and weight
+type PriorityConfigFactory struct {
+	Function          PriorityFunctionFactory
+	MapReduceFunction PriorityFunctionFactory2
+	//这个是权重值，不同的Priority有不同的值
+	Weight            int
+}
+
+// PriorityMapFunction is a function that computes per-node results for a given node.
+// TODO: Figure out the exact API of this method.
+// TODO: Change interface{} to a specific type.
+// 这里跟之前的很像不过是一个pod与node一对一打分，可以并行执行。
+type PriorityMapFunction func(pod *v1.Pod, meta interface{}, nodeInfo *schedulercache.NodeInfo) (schedulerapi.HostPriority, error)
+
+// PriorityReduceFunction is a function that aggregated per-node results and computes
+// final scores for all nodes.
+// TODO: Figure out the exact API of this method.
+// TODO: Change interface{} to a specific type.
+// 这里是Reduce方法，将这个Pod对于node所打的分汇总
+type PriorityReduceFunction func(pod *v1.Pod, meta interface{}, nodeNameToInfo map[string]*schedulercache.NodeInfo, result schedulerapi.HostPriorityList) error
+
+```
+
+所以defaultPriorities()方法注册了如下 priority 的操作
+
+```
+SelectorSpreadPriority
+InterPodAffinityPriority
+LeastRequestedPriority
+BalancedResourceAllocation
+NodePreferAvoidPodsPriority
+NodeAffinityPriority
+TaintTolerationPriority
+```
+
+
 
 
