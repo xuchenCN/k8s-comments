@@ -1116,7 +1116,7 @@ func PrioritizeNodes(
 	// If no priority configs are provided, then the EqualPriority function is applied
 	// This is required to generate the priority list in the required format
 	
-	// 
+	// 先做一次校验，如果没有priorityConfigs和extenders那就全部打1分
 	if len(priorityConfigs) == 0 && len(extenders) == 0 {
 		result := make(schedulerapi.HostPriorityList, 0, len(nodes))
 		for i := range nodes {
@@ -1139,11 +1139,13 @@ func PrioritizeNodes(
 		defer mu.Unlock()
 		errs = append(errs, err)
 	}
-
+	
+	// 构建results先把所有元素初始化为nil
 	results := make([]schedulerapi.HostPriorityList, 0, len(priorityConfigs))
 	for range priorityConfigs {
 		results = append(results, nil)
 	}
+	// 首先是判断是否用的老的Function方式，这种方式使用waitgroup来进行
 	for i, priorityConfig := range priorityConfigs {
 		if priorityConfig.Function != nil {
 			// DEPRECATED
@@ -1157,9 +1159,12 @@ func PrioritizeNodes(
 				}
 			}(i, priorityConfig)
 		} else {
+			// 如果用的map-reduce方法则先构建 result[i] 对应的 []HostPriorityList
 			results[i] = make(schedulerapi.HostPriorityList, len(nodes))
 		}
 	}
+	// 这个
+	
 	processNode := func(index int) {
 		nodeInfo := nodeNameToInfo[nodes[index].Name]
 		var err error
