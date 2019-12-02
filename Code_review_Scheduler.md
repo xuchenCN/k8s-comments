@@ -1274,10 +1274,10 @@ func (g *genericScheduler) selectHost(priorityList schedulerapi.HostPriorityList
 	
 	// 最大分数
 	maxScore := priorityList[0].Score
-	// 获得最大分数后的那个index 例如[10,10,9] 这个index=2
+	// 获得最高分数后的那个host index 例如[10,10,9] 这个index=2
 	firstAfterMaxScore := sort.Search(len(priorityList), func(i int) bool { return priorityList[i].Score < maxScore })
 	
-	// 这种算法可以在
+	// 这种算法可以在最高分的几个host钟进行轮询选择
 	g.lastNodeIndexLock.Lock()
 	ix := int(g.lastNodeIndex % uint64(firstAfterMaxScore))
 	g.lastNodeIndex++
@@ -1285,4 +1285,10 @@ func (g *genericScheduler) selectHost(priorityList schedulerapi.HostPriorityList
 
 	return priorityList[ix].Host, nil
 }
+```
+
+至此选择最高分host完成，回到 scheduleOne()
+
+```
+dest, err := s.config.Algorithm.Schedule(pod, s.config.NodeLister)
 ```
