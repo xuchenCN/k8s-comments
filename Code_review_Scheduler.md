@@ -781,4 +781,94 @@ func NewGenericScheduler(
 }
 ```
 
-完成了一
+完成了一系列的创建设置最后返回了一个 scheduler.Config
+
+```
+&scheduler.Config{
+		SchedulerCache: f.schedulerCache,
+		// The scheduler only needs to consider schedulable nodes.
+		NodeLister:          &nodePredicateLister{f.nodeLister},
+		Algorithm:           algo,
+		Binder:              &binder{f.client},
+		PodConditionUpdater: &podConditionUpdater{f.client},
+		NextPod: func() *v1.Pod {
+			return f.getNextPod()
+		},
+		Error:          f.MakeDefaultErrorFunc(podBackoff, f.podQueue),
+		StopEverything: f.StopEverything,
+	}
+```
+
+scheduler.Config 结构体
+
+```
+// TODO over time we should make this struct a hidden implementation detail of the scheduler.
+type Config struct {
+	// It is expected that changes made via SchedulerCache will be observed
+	// by NodeLister and Algorithm.
+	SchedulerCache schedulercache.Cache
+	NodeLister     algorithm.NodeLister
+	Algorithm      algorithm.ScheduleAlgorithm
+	Binder         Binder
+	// PodConditionUpdater is used only in case of scheduling errors. If we succeed
+	// with scheduling, PodScheduled condition will be updated in apiserver in /bind
+	// handler so that binding and setting PodCondition it is atomic.
+	PodConditionUpdater PodConditionUpdater
+
+	// NextPod should be a function that blocks until the next pod
+	// is available. We don't use a channel for this, because scheduling
+	// a pod may take some amount of time and we don't want pods to get
+	// stale while they sit in a channel.
+	NextPod func() *v1.Pod
+
+	// Error is called if there is an error. It is passed the pod in
+	// question, and the error
+	Error func(*v1.Pod, error)
+
+	// Recorder is the EventRecorder to use
+	Recorder record.EventRecorder
+
+	// Close this to shut down the scheduler.
+	StopEverything chan struct{}
+}
+```
+
+回头看 c.Create()
+
+```
+// NewFromConfigurator returns a new scheduler that is created entirely by the Configurator.  Assumes Create() is implemented.
+// Supports intermediate Config mutation for now if you provide modifier functions which will run after Config is created.
+func NewFromConfigurator(c Configurator, modifiers ...func(c *Config)) (*Scheduler, error) {
+	cfg, err := c.Create()
+	if err != nil {
+		return nil, err
+	}
+	// Mutate it if any functions were provided, changes might be required for certain types of tests (i.e. change the recorder).
+	for _, modifier := range modifiers {
+		modifier(cfg)
+	}
+	// From this point on the config is immutable to the outside.
+	s := &Scheduler{
+		config: cfg,
+	}
+	metrics.Register()
+	return s, nil
+}
+```
+
+注册 metrics
+
+```
+var registerMetrics sync.Once
+
+// Register all metrics.
+func Register() {
+	// Register the metrics.
+	registerMetrics.Do(func() {
+		prometheus.MustRegister(E2eSchedulingLatency)
+		prometheus.MustRegister(SchedulingAlgorithmLatency)
+		prometheus.MustRegister(BindingLatency)
+	})
+}
+```
+
