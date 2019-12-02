@@ -1031,10 +1031,12 @@ var filtered []*v1.Node
 		var filteredLen int32
 
 		// We can use the same metadata producer for all nodes.
-		// 
+		// 创建meta
 		meta := metadataProducer(pod, nodeNameToInfo)
+		// chechNode方法
 		checkNode := func(i int) {
 			nodeName := nodes[i].Name
+			// 
 			fits, failedPredicates, err := podFitsOnNode(pod, meta, nodeNameToInfo[nodeName], predicateFuncs)
 			if err != nil {
 				predicateResultLock.Lock()
