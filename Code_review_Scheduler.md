@@ -605,6 +605,35 @@ NodeAffinityPriority
 TaintTolerationPriority
 ```
 
+对于 ClusterAutoscalerProver
 
+```
+// Cluster autoscaler friendly scheduling algorithm.
+	factory.RegisterAlgorithmProvider(ClusterAutoscalerProvider, defaultPredicates(),
+		copyAndReplace(defaultPriorities(), "LeastRequestedPriority", "MostRequestedPriority"))
+```
 
+随后注册了一些默认Predicate里没有的
 
+```
+	// Registers predicates and priorities that are not enabled by default, but user can pick when creating his
+	// own set of priorities/predicates.
+
+	// PodFitsPorts has been replaced by PodFitsHostPorts for better user understanding.
+	// For backwards compatibility with 1.0, PodFitsPorts is registered as well.
+	factory.RegisterFitPredicate("PodFitsPorts", predicates.PodFitsHostPorts)
+	// Fit is defined based on the absence of port conflicts.
+	// This predicate is actually a default predicate, because it is invoked from
+	// predicates.GeneralPredicates()
+	factory.RegisterFitPredicate("PodFitsHostPorts", predicates.PodFitsHostPorts)
+	// Fit is determined by resource availability.
+	// This predicate is actually a default predicate, because it is invoked from
+	// predicates.GeneralPredicates()
+	factory.RegisterFitPredicate("PodFitsResources", predicates.PodFitsResources)
+	// Fit is determined by the presence of the Host parameter and a string match
+	// This predicate is actually a default predicate, because it is invoked from
+	// predicates.GeneralPredicates()
+	factory.RegisterFitPredicate("HostName", predicates.PodFitsHost)
+	// Fit is determined by node selector query.
+	factory.RegisterFitPredicate("MatchNodeSelector", predicates.PodSelectorMatches)
+```
