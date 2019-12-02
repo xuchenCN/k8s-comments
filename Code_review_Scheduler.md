@@ -1198,7 +1198,9 @@ func PrioritizeNodes(
 		}(i, priorityConfig)
 	}
 	// Wait for all computations to be finished.
+	// 等待所有异步方法执行完成
 	wg.Wait()
+	// 如果执行有错误则返回
 	if len(errs) != 0 {
 		return schedulerapi.HostPriorityList{}, errors.NewAggregate(errs)
 	}
@@ -1207,12 +1209,15 @@ func PrioritizeNodes(
 	result := make(schedulerapi.HostPriorityList, 0, len(nodes))
 	// TODO: Consider parallelizing it.
 	for i := range nodes {
+		// 首先初始化分数为0
 		result = append(result, schedulerapi.HostPriority{Host: nodes[i].Name, Score: 0})
+		// 随后循环增加分数 j 是所有的priorityConfigs, i 对应每个Node, 还要乘以Weight
 		for j := range priorityConfigs {
 			result[i].Score += results[j][i].Score * priorityConfigs[j].Weight
 		}
 	}
-
+	
+	// 如果有extenders 还要加上这些打分
 	if len(extenders) != 0 && nodes != nil {
 		combinedScores := make(map[string]int, len(nodeNameToInfo))
 		for _, extender := range extenders {
@@ -1244,6 +1249,40 @@ func PrioritizeNodes(
 			glog.V(10).Infof("Host %s => Score %d", result[i].Host, result[i].Score)
 		}
 	}
+	// 返回打分总数集合
 	return result, nil
+}
+```
+
+分打完了，开始选择host
+
+```
+return g.selectHost(priorityList)
+```
+
+最后这个选host的方法看下
+
+```
+// selectHost takes a prioritized list of nodes and then picks one
+// in a round-robin manner from the nodes that had the highest score.
+func (g *genericScheduler) selectHost(priorityList schedulerapi.HostPriorityList) (string, error) {
+	if len(priorityList) == 0 {
+		return "", fmt.Errorf("empty priorityList")
+	}
+	// 先从大到小排序
+	sort.Sort(sort.Reverse(priorityList))
+	
+	// 最大分数
+	maxScore := priorityList[0].Score
+	// 获得最大分数后的那个index 例如[10,10,9] 这个index=2
+	firstAfterMaxScore := sort.Search(len(priorityList), func(i int) bool { return priorityList[i].Score < maxScore })
+	
+	// 这种算法可以在
+	g.lastNodeIndexLock.Lock()
+	ix := int(g.lastNodeIndex % uint64(firstAfterMaxScore))
+	g.lastNodeIndex++
+	g.lastNodeIndexLock.Unlock()
+
+	return priorityList[ix].Host, nil
 }
 ```
