@@ -1036,7 +1036,7 @@ var filtered []*v1.Node
 		// chechNode方法
 		checkNode := func(i int) {
 			nodeName := nodes[i].Name
-			// 
+			// 这里会走一遍所有的predicate方法并记录被过滤掉的原因
 			fits, failedPredicates, err := podFitsOnNode(pod, meta, nodeNameToInfo[nodeName], predicateFuncs)
 			if err != nil {
 				predicateResultLock.Lock()
@@ -1045,15 +1045,20 @@ var filtered []*v1.Node
 				return
 			}
 			if fits {
+				// Node可以fit 自增 filteredLen 随后记录 filtered
 				filtered[atomic.AddInt32(&filteredLen, 1)-1] = nodes[i]
 			} else {
+				// Node 无法fit 记录原因
 				predicateResultLock.Lock()
 				failedPredicateMap[nodeName] = failedPredicates
 				predicateResultLock.Unlock()
 			}
 		}
+		// 并行处理 chechNode
 		workqueue.Parallelize(16, len(nodes), checkNode)
+		// 获得最终 filtered 数据
 		filtered = filtered[:filteredLen]
+		// 
 		if len(errs) > 0 {
 			return []*v1.Node{}, FailedPredicateMap{}, errors.NewAggregate(errs)
 		}
