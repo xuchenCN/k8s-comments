@@ -1058,12 +1058,13 @@ var filtered []*v1.Node
 		workqueue.Parallelize(16, len(nodes), checkNode)
 		// 获得最终 filtered 数据
 		filtered = filtered[:filteredLen]
-		// 
+		// 处理错误
 		if len(errs) > 0 {
 			return []*v1.Node{}, FailedPredicateMap{}, errors.NewAggregate(errs)
 		}
 	}
-
+	
+	// 当有extender的filter时进行扩展的filter方法
 	if len(filtered) > 0 && len(extenders) != 0 {
 		for _, extender := range extenders {
 			filteredList, failedMap, err := extender.Filter(pod, filtered, nodeNameToInfo)
@@ -1086,5 +1087,5 @@ var filtered []*v1.Node
 	return filtered, failedPredicateMap, nil
 ```
 
-
+至此完成了 predicate 操作，过滤掉了pod不能放置的Node
 
