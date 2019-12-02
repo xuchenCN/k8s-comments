@@ -996,8 +996,21 @@ if pod.DeletionTimestamp != nil {
 		return
 	}
 	
-// 开始调度
+// 开始调度，默认使用的是 genericScheduler
 dest, err := s.config.Algorithm.Schedule(pod, s.config.NodeLister)
+```
+
+查看 Scheduler() 
+
+```
+func (g *genericScheduler) Schedule(pod *v1.Pod, nodeLister algorithm.NodeLister) (string, error) 
+...
+// 首先将cache里最新的[]nodeInfo 都导入到 cachedNodeInfoMap map[string]*schedulercache.NodeInfo 中
+// 当cache中没有的删除cachedNodeInfoMap中的数据
+err = g.cache.UpdateNodeNameToInfoMap(g.cachedNodeInfoMap)
+
+// 正式开始计算 predicate
+
 ```
 
 
