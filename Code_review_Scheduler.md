@@ -335,8 +335,9 @@ func GetAlgorithmProvider(name string) (*AlgorithmProviderConfig, error) {
 		})
 ```
 
-```
+先看 PredicateMetadata
 
+```
 // GetMetadata returns the predicateMetadata used which will be used by various predicates.
 func (pfactory *PredicateMetadataFactory) GetMetadata(pod *v1.Pod, nodeNameToInfoMap map[string]*schedulercache.NodeInfo) interface{} {
 	// If we cannot compute metadata, just return nil
@@ -372,3 +373,157 @@ podRequest:                GetResourceRequest(pod),
 podPorts:                  GetUsedPorts(pod),
 matchingAntiAffinityTerms: matchingTerms,
 ```
+
+看看 PriorityMetadata
+
+```
+// priorityMetadata is a type that is passed as metadata for priority functions
+type priorityMetadata struct {
+	nonZeroRequest *schedulercache.Resource
+	podTolerations []v1.Toleration
+	affinity       *v1.Affinity
+}
+
+// PriorityMetadata is a MetadataProducer.  Node info can be nil.
+func PriorityMetadata(pod *v1.Pod, nodeNameToInfo map[string]*schedulercache.NodeInfo) interface{} {
+	// If we cannot compute metadata, just return nil
+	if pod == nil {
+		return nil
+	}
+	//这里会获得所有 len(toleration.Effect) == 0 || toleration.Effect == v1.TaintEffectPreferNoSchedule 的 toleration
+	tolerations, err := getTolerationListFromPod(pod) 
+	if err != nil {
+		return nil
+	}
+	return &priorityMetadata{
+		//NonZeroRequest是如果没有请求cpu和memory资源的话给予默认的资源量
+		//默认DefaultMilliCpuRequest=0.1 
+		//默认DefaultMemoryRequest= 200 * 1024 * 1024 //200M
+		nonZeroRequest: getNonZeroRequests(pod),
+		podTolerations: tolerations,
+		//这里是将AffinityInAnootations的Affinity与自带的融合一下
+		affinity:       schedulercache.ReconcileAffinity(pod),
+	}
+}
+```
+
+至此Predicate,Priority的两个Metadata组织完毕，接下来就是注册对应Provider的算法，默认使用的是DefaultProvider
+
+```
+// Registers algorithm providers. By default we use 'DefaultProvider', but user can specify one to be used
+// by specifying flag.
+factory.RegisterAlgorithmProvider(factory.DefaultProvider, defaultPredicates(), defaultPriorities())
+```
+
+首先看看默认的Predicates
+
+```
+
+func defaultPredicates() sets.String {
+	return sets.NewString(
+		// Fit is determined by volume zone requirements.
+		factory.RegisterFitPredicateFactory(
+			"NoVolumeZoneConflict",
+			func(args factory.PluginFactoryArgs) algorithm.FitPredicate {
+				return predicates.NewVolumeZonePredicate(args.PVInfo, args.PVCInfo)
+			},
+		),
+		// Fit is determined by whether or not there would be too many AWS EBS volumes attached to the node
+		factory.RegisterFitPredicateFactory(
+			"MaxEBSVolumeCount",
+			func(args factory.PluginFactoryArgs) algorithm.FitPredicate {
+				// TODO: allow for generically parameterized scheduler predicates, because this is a bit ugly
+				maxVols := getMaxVols(aws.DefaultMaxEBSVolumes)
+				return predicates.NewMaxPDVolumeCountPredicate(predicates.EBSVolumeFilter, maxVols, args.PVInfo, args.PVCInfo)
+			},
+		),
+		// Fit is determined by whether or not there would be too many GCE PD volumes attached to the node
+		factory.RegisterFitPredicateFactory(
+			"MaxGCEPDVolumeCount",
+			func(args factory.PluginFactoryArgs) algorithm.FitPredicate {
+				// TODO: allow for generically parameterized scheduler predicates, because this is a bit ugly
+				maxVols := getMaxVols(DefaultMaxGCEPDVolumes)
+				return predicates.NewMaxPDVolumeCountPredicate(predicates.GCEPDVolumeFilter, maxVols, args.PVInfo, args.PVCInfo)
+			},
+		),
+		// Fit is determined by whether or not there would be too many Azure Disk volumes attached to the node
+		factory.RegisterFitPredicateFactory(
+			"MaxAzureDiskVolumeCount",
+			func(args factory.PluginFactoryArgs) algorithm.FitPredicate {
+				// TODO: allow for generically parameterized scheduler predicates, because this is a bit ugly
+				maxVols := getMaxVols(DefaultMaxAzureDiskVolumes)
+				return predicates.NewMaxPDVolumeCountPredicate(predicates.AzureDiskVolumeFilter, maxVols, args.PVInfo, args.PVCInfo)
+			},
+		),
+		// Fit is determined by inter-pod affinity.
+		factory.RegisterFitPredicateFactory(
+			"MatchInterPodAffinity",
+			func(args factory.PluginFactoryArgs) algorithm.FitPredicate {
+				return predicates.NewPodAffinityPredicate(args.NodeInfo, args.PodLister)
+			},
+		),
+
+		// Fit is determined by non-conflicting disk volumes.
+		factory.RegisterFitPredicate("NoDiskConflict", predicates.NoDiskConflict),
+
+		// GeneralPredicates are the predicates that are enforced by all Kubernetes components
+		// (e.g. kubelet and all schedulers)
+		factory.RegisterFitPredicate("GeneralPredicates", predicates.GeneralPredicates),
+
+		// Fit is determined based on whether a pod can tolerate all of the node's taints
+		factory.RegisterFitPredicate("PodToleratesNodeTaints", predicates.PodToleratesNodeTaints),
+
+		// Fit is determined by node memory pressure condition.
+		factory.RegisterFitPredicate("CheckNodeMemoryPressure", predicates.CheckNodeMemoryPressurePredicate),
+
+		// Fit is determined by node disk pressure condition.
+		factory.RegisterFitPredicate("CheckNodeDiskPressure", predicates.CheckNodeDiskPressurePredicate),
+	)
+}
+```
+
+注册方法是这样的
+
+```
+// RegisterFitPredicate registers a fit predicate with the algorithm
+// registry. Returns the name with which the predicate was registered.
+func RegisterFitPredicate(name string, predicate algorithm.FitPredicate) string {
+	return RegisterFitPredicateFactory(name, func(PluginFactoryArgs) algorithm.FitPredicate { return predicate })
+}
+
+// RegisterFitPredicateFactory registers a fit predicate factory with the
+// algorithm registry. Returns the name with which the predicate was registered.
+func RegisterFitPredicateFactory(name string, predicateFactory FitPredicateFactory) string {
+	schedulerFactoryMutex.Lock()
+	defer schedulerFactoryMutex.Unlock()
+	validateAlgorithmNameOrDie(name)
+	fitPredicateMap[name] = predicateFactory
+	return name
+}
+```
+
+其中两个关键的struct是 
+
+```
+// PluginFactoryArgs are passed to all plugin factory functions.
+type PluginFactoryArgs struct {
+	PodLister                      algorithm.PodLister
+	ServiceLister                  algorithm.ServiceLister
+	ControllerLister               algorithm.ControllerLister
+	ReplicaSetLister               algorithm.ReplicaSetLister
+	StatefulSetLister              algorithm.StatefulSetLister
+	NodeLister                     algorithm.NodeLister
+	NodeInfo                       predicates.NodeInfo
+	PVInfo                         predicates.PersistentVolumeInfo
+	PVCInfo                        predicates.PersistentVolumeClaimInfo
+	HardPodAffinitySymmetricWeight int
+}
+
+// FitPredicate is a function that indicates if a pod fits into an existing node.
+// The failure information is given by the error.
+// TODO: Change interface{} to a specific type.
+type FitPredicate func(pod *v1.Pod, meta interface{}, nodeInfo *schedulercache.NodeInfo) (bool, []PredicateFailureReason, error)
+
+```
+
+
