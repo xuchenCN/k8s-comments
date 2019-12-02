@@ -675,3 +675,110 @@ TaintTolerationPriority
 ```
 
 至此貌似所有的算法都注册完成了
+
+回到之前的地方
+
+```
+type AlgorithmProviderConfig struct {
+	FitPredicateKeys     sets.String
+	PriorityFunctionKeys sets.String
+}
+// 这里的 provider 是AlgorithmProviderConfig
+provider, ok := algorithmProviderMap[name]
+```
+
+随后看看最后创建scheduler.Config的过程
+
+```
+return f.CreateFromKeys(provider.FitPredicateKeys, provider.PriorityFunctionKeys, []algorithm.SchedulerExtender{})
+```
+
+```
+
+// Creates a scheduler from a set of registered fit predicate keys and priority keys.
+func (f *ConfigFactory) CreateFromKeys(predicateKeys, priorityKeys sets.String, extenders []algorithm.SchedulerExtender) (*scheduler.Config, error) {
+	glog.V(2).Infof("Creating scheduler with fit predicates '%v' and priority functions '%v", predicateKeys, priorityKeys)
+
+	if f.GetHardPodAffinitySymmetricWeight() < 0 || f.GetHardPodAffinitySymmetricWeight() > 100 {
+		return nil, fmt.Errorf("invalid hardPodAffinitySymmetricWeight: %d, must be in the range 0-100", f.GetHardPodAffinitySymmetricWeight())
+	}
+	// 这里会返回 map[string]algorithm.FitPredicate
+	predicateFuncs, err := f.GetPredicates(predicateKeys)
+	if err != nil {
+		return nil, err
+	}
+	// 这里返回 []algorithm.PriorityConfig
+	priorityConfigs, err := f.GetPriorityFunctionConfigs(priorityKeys)
+	if err != nil {
+		return nil, err
+	}
+	
+	// 返回priorityMetadata
+	priorityMetaProducer, err := f.GetPriorityMetadataProducer()
+	if err != nil {
+		return nil, err
+	}
+	
+	// 返回predicateMetadata
+	predicateMetaProducer, err := f.GetPredicateMetadataProducer()
+	if err != nil {
+		return nil, err
+	}
+	
+	// 这里启动会开始向队列里推送pod
+	f.Run()
+	
+	// 这里正是创建Scheduler对象
+	algo := core.NewGenericScheduler(f.schedulerCache, predicateFuncs, predicateMetaProducer, priorityConfigs, priorityMetaProducer, extenders)
+	podBackoff := util.CreateDefaultPodBackoff()
+	return &scheduler.Config{
+		SchedulerCache: f.schedulerCache,
+		// The scheduler only needs to consider schedulable nodes.
+		NodeLister:          &nodePredicateLister{f.nodeLister},
+		Algorithm:           algo,
+		Binder:              &binder{f.client},
+		PodConditionUpdater: &podConditionUpdater{f.client},
+		NextPod: func() *v1.Pod {
+			return f.getNextPod()
+		},
+		Error:          f.MakeDefaultErrorFunc(podBackoff, f.podQueue),
+		StopEverything: f.StopEverything,
+	}, nil
+}
+```
+
+f.Run()
+
+```
+func (f *ConfigFactory) Run() {
+	// Watch and queue pods that need scheduling.
+	cache.NewReflector(f.createUnassignedNonTerminatedPodLW(), &v1.Pod{}, f.podQueue, 0).RunUntil(f.StopEverything)
+
+	// Begin populating scheduled pods.
+	go f.scheduledPodPopulator.Run(f.StopEverything)
+}
+```
+
+algo := core.NewGenericScheduler(f.schedulerCache, predicateFuncs, predicateMetaProducer, priorityConfigs, priorityMetaProducer, extenders)
+
+```
+func NewGenericScheduler(
+	cache schedulercache.Cache,
+	predicates map[string]algorithm.FitPredicate,
+	predicateMetaProducer algorithm.MetadataProducer,
+	prioritizers []algorithm.PriorityConfig,
+	priorityMetaProducer algorithm.MetadataProducer,
+	extenders []algorithm.SchedulerExtender) algorithm.ScheduleAlgorithm {
+	return &genericScheduler{
+		cache:                 cache,
+		predicates:            predicates,
+		predicateMetaProducer: predicateMetaProducer,
+		prioritizers:          prioritizers,
+		priorityMetaProducer:  priorityMetaProducer,
+		extenders:             extenders,
+		cachedNodeInfoMap:     make(map[string]*schedulercache.NodeInfo),
+	}
+}
+```
+
+完成了一
