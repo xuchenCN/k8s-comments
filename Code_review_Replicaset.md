@@ -324,10 +324,15 @@ func (m *baseControllerRefManager) claimObject(obj metav1.Object, match func(met
 		// Owned by us but selector doesn't match.
 		// Try to release, unless we're being deleted.
 		// 到这里就是Pod不match但是Ref是一样的
-		
+		// 先看看自己是不是要被删除掉了
 		if m.controller.GetDeletionTimestamp() != nil {
 			return false, nil
 		}
+                // 尝试删除Ref这里实际的动作
+                /**
+deleteOwnerRefPatch := fmt.Sprintf(`{"metadata":{"ownerReferences":[{"$patch":"delete","uid":"%s"}],"uid":"%s"}}`, m.controller.GetUID(), pod.UID)
+	err := m.podControl.PatchPod(pod.Namespace, pod.Name, []byte(deleteOwnerRefPatch))
+*/
 		if err := release(obj); err != nil {
 			// If the pod no longer exists, ignore the error.
 			if errors.IsNotFound(err) {
@@ -340,13 +345,21 @@ func (m *baseControllerRefManager) claimObject(obj metav1.Object, match func(met
 		// Successfully released.
 		return false, nil
 	}
-
+        // 这个Pod没有Ref先看看我们能不能接收Pod
 	// It's an orphan.
 	if m.controller.GetDeletionTimestamp() != nil || !match(obj) {
 		// Ignore if we're being deleted or selector doesn't match.
 		return false, nil
 	}
 	// Selector matches. Try to adopt.
+        // 尝试接收 实际接收方法也是打Patch
+/**
+addControllerPatch := fmt.Sprintf(
+		`{"metadata":{"ownerReferences":[{"apiVersion":"%s","kind":"%s","name":"%s","uid":"%s","controller":true,"blockOwnerDeletion":true}],"uid":"%s"}}`,
+		m.controllerKind.GroupVersion(), m.controllerKind.Kind,
+		m.controller.GetName(), m.controller.GetUID(), pod.UID)
+	return m.podControl.PatchPod(pod.Namespace, pod.Name, []byte(addControllerPatch))
+*/
 	if err := adopt(obj); err != nil {
 		// If the pod no longer exists, ignore the error.
 		if errors.IsNotFound(err) {
@@ -361,6 +374,129 @@ func (m *baseControllerRefManager) claimObject(obj metav1.Object, match func(met
 }
 ```
 
+终于把属于自己的Pod找齐了继续工作
+
+```
+// 这里就是具体判断Pod数量然后多余的删除，缺少的补足的地方了
+var manageReplicasErr error
+	if rsNeedsSync && rs.DeletionTimestamp == nil {
+		manageReplicasErr = rsc.manageReplicas(filteredPods, rs)
+	}
+```
+
+这个方法是ReplicaSet的主要工作内容
+
+```
+
+// manageReplicas checks and updates replicas for the given ReplicaSet.
+// Does NOT modify <filteredPods>.
+// It will requeue the replica set in case of an error while creating/deleting pods.
+func (rsc *ReplicaSetController) manageReplicas(filteredPods []*v1.Pod, rs *extensions.ReplicaSet) error {
+        // 先算diff 看看比之前的设置是多是少
+	diff := len(filteredPods) - int(*(rs.Spec.Replicas))
+	rsKey, err := controller.KeyFunc(rs)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("Couldn't get key for ReplicaSet %#v: %v", rs, err))
+		return nil
+	}
+	var errCh chan error
+        // diff小于0 说明应该增加Pod
+	if diff < 0 {
+                // 先abs一下
+		diff *= -1
+		errCh = make(chan error, diff)
+                // 这里burstReplicas=500
+		if diff > rsc.burstReplicas {
+			diff = rsc.burstReplicas
+		}
+		// TODO: Track UIDs of creates just like deletes. The problem currently
+		// is we'd need to wait on the result of a create to record the pod's
+		// UID, which would require locking *across* the create, which will turn
+		// into a performance bottleneck. We should generate a UID for the pod
+		// beforehand and store it via ExpectCreations.
+		rsc.expectations.ExpectCreations(rsKey, diff)
+		var wg sync.WaitGroup
+		wg.Add(diff)
+		glog.V(2).Infof("Too few %q/%q replicas, need %d, creating %d", rs.Namespace, rs.Name, *(rs.Spec.Replicas), diff)
+		for i := 0; i < diff; i++ {
+			go func() {
+				defer wg.Done()
+				var err error
+				boolPtr := func(b bool) *bool { return &b }
+				controllerRef := &metav1.OwnerReference{
+					APIVersion:         controllerKind.GroupVersion().String(),
+					Kind:               controllerKind.Kind,
+					Name:               rs.Name,
+					UID:                rs.UID,
+					BlockOwnerDeletion: boolPtr(true),
+					Controller:         boolPtr(true),
+				}
+                                // 这里就是具体创建Pod的动作了
+				err = rsc.podControl.CreatePodsWithControllerRef(rs.Namespace, &rs.Spec.Template, rs, controllerRef)
+				if err != nil {
+					// Decrement the expected number of creates because the informer won't observe this pod
+					glog.V(2).Infof("Failed creation, decrementing expectations for replica set %q/%q", rs.Namespace, rs.Name)
+					rsc.expectations.CreationObserved(rsKey)
+					errCh <- err
+				}
+			}()
+		}
+		wg.Wait()
+	} else if diff > 0 { //大于0说明多了
+		if diff > rsc.burstReplicas {
+			diff = rsc.burstReplicas
+		}
+		errCh = make(chan error, diff)
+		glog.V(2).Infof("Too many %q/%q replicas, need %d, deleting %d", rs.Namespace, rs.Name, *(rs.Spec.Replicas), diff)
+		// No need to sort pods if we are about to delete all of them
+		if *(rs.Spec.Replicas) != 0 {
+                        // 要删除多余的Pod先按照状态排序，把那些不在工作状态的Pod放在前边
+			// Sort the pods in the order such that not-ready < ready, unscheduled
+			// < scheduled, and pending < running. This ensures that we delete pods
+			// in the earlier stages whenever possible.
+			sort.Sort(controller.ActivePods(filteredPods))
+		}
+		// Snapshot the UIDs (ns/name) of the pods we're expecting to see
+		// deleted, so we know to record their expectations exactly once either
+		// when we see it as an update of the deletion timestamp, or as a delete.
+		// Note that if the labels on a pod/rs change in a way that the pod gets
+		// orphaned, the rs will only wake up after the expectations have
+		// expired even if other pods are deleted.
+		deletedPodKeys := []string{}
+                // 开始记录要删除的Pod
+		for i := 0; i < diff; i++ {
+			deletedPodKeys = append(deletedPodKeys, controller.PodKey(filteredPods[i]))
+		}
+		rsc.expectations.ExpectDeletions(rsKey, deletedPodKeys)
+		var wg sync.WaitGroup
+		wg.Add(diff)
+		for i := 0; i < diff; i++ {
+			go func(ix int) {
+				defer wg.Done()
+                                // 这里具体删除Pod
+				if err := rsc.podControl.DeletePod(rs.Namespace, filteredPods[ix].Name, rs); err != nil {
+					// Decrement the expected number of deletes because the informer won't observe this deletion
+					podKey := controller.PodKey(filteredPods[ix])
+					glog.V(2).Infof("Failed to delete %v, decrementing expectations for controller %q/%q", podKey, rs.Namespace, rs.Name)
+					rsc.expectations.DeletionObserved(rsKey, podKey)
+					errCh <- err
+				}
+			}(i)
+		}
+		wg.Wait()
+	}
+
+	select {
+	case err := <-errCh:
+		// all errors have been reported before and they're likely to be the same, so we'll only return the first one we hit.
+		if err != nil {
+			return err
+		}
+	default:
+	}
+	return nil
+}
+```
 
 
 
