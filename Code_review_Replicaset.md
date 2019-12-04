@@ -132,7 +132,7 @@ func (rsc *ReplicaSetController) addPod(obj interface{}) {
 		return
 	}
 	
-	// 
+	// 这里会获得当前pod的ControllerRef 并且判断是否属于ReplicaSet
 	// If it has a ControllerRef, that's all that matters.
 	if controllerRef := controller.GetControllerOf(pod); controllerRef != nil {
 		rs := rsc.resolveControllerRef(pod.Namespace, controllerRef)
@@ -143,6 +143,8 @@ func (rsc *ReplicaSetController) addPod(obj interface{}) {
 		if err != nil {
 			return
 		}
+		glog.V(4).Infof("Pod %s created: %#v.", pod.Name, pod)
+		// 这里
 		glog.V(4).Infof("Pod %s created: %#v.", pod.Name, pod)
 		rsc.expectations.CreationObserved(rsKey)
 		rsc.enqueueReplicaSet(rs)
