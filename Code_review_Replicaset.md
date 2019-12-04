@@ -498,6 +498,31 @@ func (rsc *ReplicaSetController) manageReplicas(filteredPods []*v1.Pod, rs *exte
 }
 ```
 
+回到之前的方法，后续剩下的就是更新ReplicaSet的状态了
 
+```
+copy, err := api.Scheme.DeepCopy(rs)
+	if err != nil {
+		return err
+	}
+	rs = copy.(*extensions.ReplicaSet)
+
+	newStatus := calculateStatus(rs, filteredPods, manageReplicasErr)
+
+	// Always updates status as pods come up or die.
+	updatedRS, err := updateReplicaSetStatus(rsc.kubeClient.Extensions().ReplicaSets(rs.Namespace), rs, newStatus)
+	if err != nil {
+		// Multiple things could lead to this update failing. Requeuing the replica set ensures
+		// Returning an error causes a requeue without forcing a hotloop
+		return err
+	}
+	// Resync the ReplicaSet after MinReadySeconds as a last line of defense to guard against clock-skew.
+	if manageReplicasErr == nil && updatedRS.Spec.MinReadySeconds > 0 &&
+		updatedRS.Status.ReadyReplicas == *(updatedRS.Spec.Replicas) &&
+		updatedRS.Status.AvailableReplicas != *(updatedRS.Spec.Replicas) {
+		rsc.enqueueReplicaSetAfter(updatedRS, time.Duration(updatedRS.Spec.MinReadySeconds)*time.Second)
+	}
+	return manageReplicasErr
+```
 
 
