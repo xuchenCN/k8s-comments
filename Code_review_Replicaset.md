@@ -12,11 +12,12 @@ func NewReplicaSetController(rsInformer extensionsinformers.ReplicaSetInformer, 
 		metrics.RegisterMetricAndTrackRateLimiterUsage("replicaset_controller", kubeClient.Core().RESTClient().GetRateLimiter())
 	}
   
-  // 这里初始化
+  	// 这里初始化EventBroadcaster
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(glog.Infof)
 	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: v1core.New(kubeClient.Core().RESTClient()).Events("")})
 
+	// 初始化Controller对象
 	rsc := &ReplicaSetController{
 		kubeClient: kubeClient,
 		podControl: controller.RealPodControl{
@@ -27,7 +28,8 @@ func NewReplicaSetController(rsInformer extensionsinformers.ReplicaSetInformer, 
 		expectations:  controller.NewUIDTrackingControllerExpectations(controller.NewControllerExpectations()),
 		queue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "replicaset"),
 	}
-
+	
+	// 设置H
 	rsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    rsc.enqueueReplicaSet,
 		UpdateFunc: rsc.updateRS,
