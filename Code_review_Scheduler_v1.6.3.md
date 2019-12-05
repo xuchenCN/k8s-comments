@@ -1,4 +1,4 @@
-## 观察kube-scheduler的工作流程
+## 观察kube-scheduler的工作流程 该过程基于v1.6.3解析，比较简单适合入门
 
 Scheduler入口
 [k8s.io/kubernetes/plugin/cmd/kube-scheduler/scheduler.go](k8s.io/kubernetes/plugin/cmd/kube-scheduler/scheduler.go)
