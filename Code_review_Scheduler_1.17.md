@@ -142,3 +142,10 @@ func NewSchedulerCommand(registryOptions ...Option) *cobra.Command {
 
 至此呢就是设置了相关的选项，开始正式运行```runCommand()```
 
+首先
+
+```
+verflag.PrintAndExitIfRequested()
+utilflag.PrintFlags(cmd.Flags())
+```
+
