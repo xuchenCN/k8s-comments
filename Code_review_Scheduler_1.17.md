@@ -1155,8 +1155,152 @@ func (sched *Scheduler) deleteNodeFromCache(obj interface{}) {
 
 ```
 
+后边这些Handler都是调动队列中的Pod去active或者backoff了
+
+```
+
+if utilfeature.DefaultFeatureGate.Enabled(features.CSINodeInfo) {
+	informerFactory.Storage().V1().CSINodes().Informer().AddEventHandler(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    sched.onCSINodeAdd,
+			UpdateFunc: sched.onCSINodeUpdate,
+		},
+	)
+}
+
+// On add and delete of PVs, it will affect equivalence cache items
+// related to persistent volume
+informerFactory.Core().V1().PersistentVolumes().Informer().AddEventHandler(
+	cache.ResourceEventHandlerFuncs{
+		// MaxPDVolumeCountPredicate: since it relies on the counts of PV.
+		AddFunc:    sched.onPvAdd,
+		UpdateFunc: sched.onPvUpdate,
+	},
+)
+
+// This is for MaxPDVolumeCountPredicate: add/delete PVC will affect counts of PV when it is bound.
+informerFactory.Core().V1().PersistentVolumeClaims().Informer().AddEventHandler(
+	cache.ResourceEventHandlerFuncs{
+		AddFunc:    sched.onPvcAdd,
+		UpdateFunc: sched.onPvcUpdate,
+	},
+)
+
+// This is for ServiceAffinity: affected by the selector of the service is updated.
+// Also, if new service is added, equivalence cache will also become invalid since
+// existing pods may be "captured" by this service and change this predicate result.
+informerFactory.Core().V1().Services().Informer().AddEventHandler(
+	cache.ResourceEventHandlerFuncs{
+		AddFunc:    sched.onServiceAdd,
+		UpdateFunc: sched.onServiceUpdate,
+		DeleteFunc: sched.onServiceDelete,
+	},
+)
+
+informerFactory.Storage().V1().StorageClasses().Informer().AddEventHandler(
+	cache.ResourceEventHandlerFuncs{
+		AddFunc: sched.onStorageClassAdd,
+	},
+)
+
+```
+
+至此scheduler对象正式初始化完成
+
+查看后续动作
+
+```
+
+// Prepare the event broadcaster.
+// 事件相关
+if cc.Broadcaster != nil && cc.EventClient != nil {
+	cc.Broadcaster.StartRecordingToSink(ctx.Done())
+}
+if cc.CoreBroadcaster != nil && cc.CoreEventClient != nil {
+	cc.CoreBroadcaster.StartRecordingToSink(&corev1.EventSinkImpl{Interface: cc.CoreEventClient.Events("")})
+}
+// Setup healthz checks.
+// health check相关，这里是判断leaderelector的超时问题
+var checks []healthz.HealthChecker
+if cc.ComponentConfig.LeaderElection.LeaderElect {
+	checks = append(checks, cc.LeaderElection.WatchDog)
+}
+
+// Start up the healthz server.
+// 启动相关http的服务
+if cc.InsecureServing != nil {
+	separateMetrics := cc.InsecureMetricsServing != nil
+	handler := buildHandlerChain(newHealthzHandler(&cc.ComponentConfig, separateMetrics, checks...), nil, nil)
+	if err := cc.InsecureServing.Serve(handler, 0, ctx.Done()); err != nil {
+		return fmt.Errorf("failed to start healthz server: %v", err)
+	}
+}
+if cc.InsecureMetricsServing != nil {
+	handler := buildHandlerChain(newMetricsHandler(&cc.ComponentConfig), nil, nil)
+	if err := cc.InsecureMetricsServing.Serve(handler, 0, ctx.Done()); err != nil {
+		return fmt.Errorf("failed to start metrics server: %v", err)
+	}
+}
+if cc.SecureServing != nil {
+	handler := buildHandlerChain(newHealthzHandler(&cc.ComponentConfig, false, checks...), cc.Authentication.Authenticator, cc.Authorization.Authorizer)
+	// TODO: handle stoppedCh returned by c.SecureServing.Serve
+	if _, err := cc.SecureServing.Serve(handler, 0, ctx.Done()); err != nil {
+		// fail early for secure handlers, removing the old error loop from above
+		return fmt.Errorf("failed to start secure server: %v", err)
+	}
+}
+
+// Start all informers.
+// 开启所有informers
+go cc.PodInformer.Informer().Run(ctx.Done())
+cc.InformerFactory.Start(ctx.Done())
+
+// Wait for all caches to sync before scheduling.
+// 等待加载完成
+cc.InformerFactory.WaitForCacheSync(ctx.Done())
+
+// If leader election is enabled, runCommand via LeaderElector until done and exit.
+// 如果开启了leaderelection 开启选举流程
+if cc.LeaderElection != nil {
+	cc.LeaderElection.Callbacks = leaderelection.LeaderCallbacks{
+		OnStartedLeading: sched.Run, // 实际运行的是scheduler.Run()
+		OnStoppedLeading: func() {
+			klog.Fatalf("leaderelection lost")
+		},
+	}
+	leaderElector, err := leaderelection.NewLeaderElector(*cc.LeaderElection)
+	if err != nil {
+		return fmt.Errorf("couldn't create leader elector: %v", err)
+	}
+
+	leaderElector.Run(ctx)
+
+	return fmt.Errorf("lost lease")
+}
+
+// Leader election is disabled, so runCommand inline until done.
+sched.Run(ctx)
+return fmt.Errorf("finished without leader elect")
+
+```
+
+实际的运行
+
+```
+// Run begins watching and scheduling. It waits for cache to be synced, then starts scheduling and blocked until the context is done.
+func (sched *Scheduler) Run(ctx context.Context) {
+	// 等待Pod加载
+	if !cache.WaitForCacheSync(ctx.Done(), sched.scheduledPodsHasSynced) {
+		return
+	}
+	// 开始运行sched.scheduleOne
+	wait.UntilWithContext(ctx, sched.scheduleOne, 0)
+}
 
 
+```
+
+开始正式进入调度阶段 ```func (sched *Scheduler) scheduleOne(ctx context.Context) ```
 
 
 
