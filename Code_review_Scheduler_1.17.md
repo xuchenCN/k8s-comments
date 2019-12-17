@@ -2165,3 +2165,97 @@ return nodeName, err
 至此，抢占的逻辑完成。
 
 ```
+
+下边介绍一下错误处理逻辑，具体逻辑在```src/k8s.io/kubernetes/pkg/scheduler/factory.go```文件中
+
+在构建Scheduler的时候设置
+```
+ &Scheduler{
+	SchedulerCache:  c.schedulerCache,
+	Algorithm:       algo,
+	GetBinder:       getBinderFunc(c.client, extenders),
+	Framework:       framework,
+	NextPod:         internalqueue.MakeNextPodFunc(podQueue),
+	Error:           MakeDefaultErrorFunc(c.client, podQueue, c.schedulerCache),
+	StopEverything:  c.StopEverything,
+	VolumeBinder:    c.volumeBinder,
+	SchedulingQueue: podQueue,
+	Plugins:         plugins,
+	PluginConfig:    pluginConfig,
+}
+
+```
+
+```
+// MakeDefaultErrorFunc construct a function to handle pod scheduler error
+func MakeDefaultErrorFunc(client clientset.Interface, podQueue internalqueue.SchedulingQueue, schedulerCache internalcache.Cache) func(*framework.PodInfo, error) {
+	return func(podInfo *framework.PodInfo, err error) {
+		pod := podInfo.Pod
+		if err == core.ErrNoNodesAvailable {
+			klog.V(2).Infof("Unable to schedule %v/%v: no nodes are registered to the cluster; waiting", pod.Namespace, pod.Name)
+		} else {
+			if _, ok := err.(*core.FitError); ok {
+				klog.V(2).Infof("Unable to schedule %v/%v: no fit: %v; waiting", pod.Namespace, pod.Name, err)
+			} else if errors.IsNotFound(err) {
+				klog.V(2).Infof("Unable to schedule %v/%v: possibly due to node not found: %v; waiting", pod.Namespace, pod.Name, err)
+				if errStatus, ok := err.(errors.APIStatus); ok && errStatus.Status().Details.Kind == "node" {
+					nodeName := errStatus.Status().Details.Name
+					// when node is not found, We do not remove the node right away. Trying again to get
+					// the node and if the node is still not found, then remove it from the scheduler cache.
+					// 如果错误是因为Node找不到，则从cache中移除
+					_, err := client.CoreV1().Nodes().Get(nodeName, metav1.GetOptions{})
+					if err != nil && errors.IsNotFound(err) {
+						node := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+						if err := schedulerCache.RemoveNode(&node); err != nil {
+							klog.V(4).Infof("Node %q is not found; failed to remove it from the cache.", node.Name)
+						}
+					}
+				}
+			} else {
+				klog.Errorf("Error scheduling %v/%v: %v; retrying", pod.Namespace, pod.Name, err)
+			}
+		}
+
+		podSchedulingCycle := podQueue.SchedulingCycle()
+		// Retry asynchronously.
+		// Note that this is extremely rudimentary and we need a more real error handling path.
+		// 这里会尝试去获取Pod，并将其放置到sched.UnschedulableQ中
+		// 如果找不到这个Pod，这直接返回
+		go func() {
+			defer runtime.HandleCrash()
+			podID := types.NamespacedName{
+				Namespace: pod.Namespace,
+				Name:      pod.Name,
+			}
+
+			// An unschedulable pod will be placed in the unschedulable queue.
+			// This ensures that if the pod is nominated to run on a node,
+			// scheduler takes the pod into account when running predicates for the node.
+			// Get the pod again; it may have changed/been scheduled already.
+			getBackoff := initialGetBackoff
+			for {
+				pod, err := client.CoreV1().Pods(podID.Namespace).Get(podID.Name, metav1.GetOptions{})
+				if err == nil {
+					if len(pod.Spec.NodeName) == 0 {
+						podInfo.Pod = pod
+						if err := podQueue.AddUnschedulableIfNotPresent(podInfo, podSchedulingCycle); err != nil {
+							klog.Error(err)
+						}
+					}
+					break
+				}
+				if errors.IsNotFound(err) {
+					klog.Warningf("A pod %v no longer exists", podID)
+					return
+				}
+				klog.Errorf("Error getting pod %v for retry: %v; retrying...", podID, err)
+				if getBackoff = getBackoff * 2; getBackoff > maximalGetBackoff {
+					getBackoff = maximalGetBackoff
+				}
+				time.Sleep(getBackoff)
+			}
+		}()
+	}
+}
+
+```
