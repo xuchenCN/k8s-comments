@@ -1676,8 +1676,8 @@ assumedPod := assumedPodInfo.Pod
 // This function modifies 'assumedPod' if volume binding is required.
 // 首先是绑定volume的操作，这里涉及到了PersistentVolume和PersistentVolumeClaim的操作
 // 这里注意一下 PVs,PVCs已经在VolumeBindingChecker.predicate() 里设置了，主要是调用了 volumeBinder.FindPodVolumes()来设置的
-// 对于deleybind的PVC，通过storageclass的提供来做到调度时bind,具体的代码在pv_controller.go当中
-// 这里会通过设置一个pvutil.AnnSelectedNode来设置一个Node
+// 通过storageclass的提供PV的逻辑在pv_controller.go#syncUnboundClaim()代码中 
+// 这里会通过设置一个pvutil.AnnSelectedNode来设置一个Node,在创建Volume作为查找Node对象的依据
 allBound, err := sched.VolumeBinder.Binder.AssumePodVolumes(assumedPod, scheduleResult.SuggestedHost)
 if err != nil {
 	sched.recordSchedulingFailure(assumedPodInfo, err, SchedulerError,
