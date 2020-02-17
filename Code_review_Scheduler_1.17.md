@@ -1,7 +1,7 @@
 ## 观察kube-scheduler的工作流程，该版本基于1.17.rc.2
 由于新的调度器增加了extenderpoints功能，一些调度的关键环节支持插件式的工作模式，具体参考文档
 https://github.com/kubernetes/enhancements/blob/master/keps/sig-scheduling/20180409-scheduling-framework.md
-![scheduler-framework](https://github.com/kubernetes/enhancements/raw/master/keps/sig-scheduling/20180409-scheduling-framework-extensions.png)
+![img](./20180409-scheduling-framework-extensions.png)
 
 首先还是入口文件 k8s.io/kubernetes/cmd/kube-scheduler/scheduler.go
 在初始化的时候
